@@ -126,6 +126,9 @@ pub async fn create(http: &reqwest::Client, sing_box: &std::path::Path, index: u
         .map_err(|e| format!("無法連線到 Cloudflare WARP API: {e}"))?;
     let status = resp.status();
     let body = resp.text().await.map_err(|e| e.to_string())?;
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err("Cloudflare 暫時限制了註冊次數（429），請過幾分鐘再試。".into());
+    }
     if !status.is_success() {
         return Err(format!("WARP 註冊失敗（{status}）：{}", body.chars().take(300).collect::<String>()));
     }
@@ -152,6 +155,23 @@ pub async fn create(http: &reqwest::Client, sing_box: &std::path::Path, index: u
             mtu: WARP_MTU,
         }),
     })
+}
+
+/// Unregisters the WARP device behind a removed node (best effort), then forgets its secret.
+pub async fn deregister(http: &reqwest::Client, tag: &str) {
+    if let Some(secret) = credentials::load_warp(tag) {
+        let res = http
+            .delete(format!("{REG_URL}/{}", secret.device_id))
+            .bearer_auth(&secret.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        if let Err(e) = res {
+            log::warn!("WARP 裝置註銷失敗（{tag}）: {e}");
+        }
+    }
+    credentials::delete_node_secret(tag);
 }
 
 /// RFC 3339 UTC timestamp with millisecond precision, as the WARP client sends for `tos`.

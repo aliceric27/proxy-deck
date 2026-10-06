@@ -1,8 +1,8 @@
 import { useState, type ReactNode } from "react";
 import { FolderOpen, KeyRound, LogOut } from "lucide-react";
-import { api, errorText } from "../lib/ipc";
+import { api, errorText, type LogLevel } from "../lib/ipc";
 import { useApp } from "../lib/store";
-import { Badge, Button, Card, Input, PageHeader, Toggle } from "../components/ui";
+import { Badge, Button, Card, Input, PageHeader, Select, Toggle } from "../components/ui";
 
 export default function Settings() {
   const { snapshot, profile, updateProfile, refresh, toast } = useApp();
@@ -45,6 +45,23 @@ export default function Settings() {
                 e.target.value = String(mtu);
                 if (mtu !== profile.tun.mtu) updateProfile((p) => ({ ...p, tun: { ...p.tun, mtu } }));
               }}
+            />
+          </Row>
+        </Card>
+
+        <Card title="日誌">
+          <Row label="sing-box 日誌等級" hint="「資訊」會記錄每一條連線與 DNS 查詢，適合排查分流問題；平常用「警告」即可。重新連線後生效。" last>
+            <Select
+              label="日誌等級"
+              value={profile.log_level}
+              onChange={(v: LogLevel) => updateProfile((p) => ({ ...p, log_level: v }))}
+              className="w-28"
+              options={[
+                { value: "error", label: "錯誤" },
+                { value: "warn", label: "警告" },
+                { value: "info", label: "資訊" },
+                { value: "debug", label: "除錯" },
+              ]}
             />
           </Row>
         </Card>

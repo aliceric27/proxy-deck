@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, Copy, Search } from "lucide-react";
-import { api, events } from "../lib/ipc";
+import { api, errorText, events, type LogBatch } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { Button, cx, Input, PageHeader, Segmented } from "../components/ui";
 
@@ -15,9 +15,14 @@ function levelOf(line: string): "error" | "warn" | "info" | "debug" | "other" {
   return "other";
 }
 
+type Line = { text: string; level: ReturnType<typeof levelOf> };
+const toLines = (texts: string[]): Line[] => texts.map((text) => ({ text, level: levelOf(text) }));
+
 export default function Logs() {
   const { toast } = useApp();
-  const [lines, setLines] = useState<string[]>([]);
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  const [lines, setLines] = useState<Line[]>([]);
   const [q, setQ] = useState("");
   const [level, setLevel] = useState<Level>("all");
   const [follow, setFollow] = useState(true);
@@ -25,8 +30,27 @@ export default function Logs() {
 
   useEffect(() => {
     let alive = true;
-    api.logs().then((l) => alive && setLines(l));
-    const un = events.coreLog((line) => setLines((prev) => (prev.length >= MAX_LINES ? [...prev.slice(-MAX_LINES + 1), line] : [...prev, line])));
+    // Subscribe before taking the snapshot; batches carry sequence numbers, so lines already
+    // in the snapshot are skipped and none fall in between.
+    let nextSeq: number | null = null;
+    const early: LogBatch[] = [];
+    const append = (b: LogBatch) => {
+      if (nextSeq === null) return void early.push(b);
+      const fresh = b.lines.slice(Math.max(0, nextSeq - b.first));
+      nextSeq = Math.max(nextSeq, b.first + b.lines.length);
+      if (fresh.length)
+        setLines((prev) => {
+          const next = prev.concat(toLines(fresh));
+          return next.length > MAX_LINES ? next.slice(-MAX_LINES) : next;
+        });
+    };
+    const un = events.coreLog(append);
+    un.then(() => api.logs()).then((snap) => {
+      if (!alive) return;
+      setLines(toLines(snap.lines.slice(-MAX_LINES)));
+      nextSeq = snap.first + snap.lines.length;
+      early.splice(0).forEach(append);
+    }, (e) => toastRef.current(errorText(e), "error"));
     return () => {
       alive = false;
       un.then((f) => f());
@@ -35,11 +59,10 @@ export default function Logs() {
 
   const visible = useMemo(() => {
     const ql = q.toLowerCase();
-    return lines.filter((l) => {
-      const lv = levelOf(l);
+    return lines.filter(({ text, level: lv }) => {
       if (level === "error" && lv !== "error") return false;
       if (level === "warn" && lv !== "error" && lv !== "warn") return false;
-      return !ql || l.toLowerCase().includes(ql);
+      return !ql || text.toLowerCase().includes(ql);
     });
   }, [lines, q, level]);
 
@@ -56,7 +79,7 @@ export default function Logs() {
           <Button
             icon={<Copy size={14} />}
             onClick={() => {
-              navigator.clipboard.writeText(visible.join("\n"));
+              navigator.clipboard.writeText(visible.map((l) => l.text).join("\n"));
               toast(`已複製 ${visible.length} 行`, "success");
             }}
           >
@@ -89,14 +112,11 @@ export default function Logs() {
         {visible.length === 0 ? (
           <p className="py-8 text-center font-sans text-muted">尚無日誌。連線後 sing-box 的輸出會顯示在這裡。</p>
         ) : (
-          visible.map((l, i) => {
-            const lv = levelOf(l);
-            return (
-              <div key={i} className={cx("break-all whitespace-pre-wrap", lv === "error" && "text-danger", lv === "warn" && "text-warn", lv === "debug" && "text-muted", l.startsWith("----") && "font-semibold text-accent")}>
-                {l}
-              </div>
-            );
-          })
+          visible.map(({ text, level: lv }, i) => (
+            <div key={i} className={cx("break-all whitespace-pre-wrap", lv === "error" && "text-danger", lv === "warn" && "text-warn", lv === "debug" && "text-muted", text.startsWith("----") && "font-semibold text-accent")}>
+              {text}
+            </div>
+          ))
         )}
         <div ref={bottom} />
       </div>

@@ -21,7 +21,7 @@ const PAGES: { id: PageId; label: string; icon: ReactNode }[] = [
 ];
 
 export default function App() {
-  const { snapshot, core, needsApply, busy, connect, disconnect, toasts, dismissToast } = useApp();
+  const { snapshot, core, profileState, busy, connect, disconnect, toasts, dismissToast } = useApp();
   const [page, setPage] = useState<PageId>("dashboard");
 
   useEffect(() => {
@@ -46,7 +46,7 @@ export default function App() {
   }
 
   const running = core.state === "running";
-  const starting = core.state === "starting";
+  const starting = core.state === "starting" || core.state === "reconnecting";
 
   return (
     <div className="flex h-full">
@@ -80,7 +80,9 @@ export default function App() {
         <div className="border-t border-border p-3">
           <div className="mb-2 flex items-center gap-2 text-xs">
             <span className={cx("h-2 w-2 rounded-full", running ? "bg-ok" : starting ? "bg-warn animate-pulse" : core.state === "error" ? "bg-danger" : "bg-border")} />
-            <span className="text-muted">{running ? "已連線" : starting ? "連線中…" : core.state === "error" ? "發生錯誤" : "未連線"}</span>
+            <span className="text-muted">
+              {running ? "已連線" : core.state === "reconnecting" ? `重新連線中（第 ${core.attempt} 次）` : starting ? "連線中…" : core.state === "error" ? "發生錯誤" : "未連線"}
+            </span>
           </div>
           <Button
             variant={running || starting ? "secondary" : "primary"}
@@ -96,7 +98,10 @@ export default function App() {
 
       <main className="flex min-w-0 flex-1 flex-col">
         <Banners onNavigate={setPage} />
-        {needsApply && running && (
+        {profileState.invalid && running && (
+          <div className="border-b border-border bg-warn-soft px-6 py-2 text-[13px] text-warn">設定有誤，修正前無法套用：{profileState.invalid}</div>
+        )}
+        {!profileState.invalid && profileState.stale && running && (
           <div className="flex items-center justify-between gap-3 border-b border-border bg-accent-soft px-6 py-2 text-[13px]">
             <span>設定已變更，重新連線後才會生效。</span>
             <Button size="sm" variant="primary" disabled={busy} onClick={connect}>

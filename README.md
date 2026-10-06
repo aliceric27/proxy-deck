@@ -28,6 +28,7 @@ app 的 manifest 要求系統管理員權限（v1 用這個方式取得 TUN 權�
 cargo test -p proxy-core                # 設定產生器與 Mudfish 清單解析
 $env:SINGBOX_BIN = "apps\desktop\src-tauri\binaries\sing-box-x86_64-pc-windows-msvc.exe"
 cargo test -p proxy-core                # 另外用真的 `sing-box check` 驗證產生的設定
+cargo test --workspace                  # 含核心狀態機（假 launcher）與權限目錄測試（需系統管理員終端機），並重新產生前端型別
 cd apps/desktop; npx tsc --noEmit       # 前端型別檢查
 ```
 
@@ -49,4 +50,5 @@ docs/                     PLAN.md 與 M0 驗證腳本
 |---|---|
 | Mudfish 帳密 | Windows 認證管理員（`ProxyDesk` / `mudfish-account`） |
 | 設定（不含密碼）、節點清單快取 | `%APPDATA%\tw.proxydesk.desktop\` |
-| 產生的 sing-box 設定（含帳密，只在連線期間存在；沿用使用者資料夾的預設權限：本人、SYSTEM、系統管理員）、cache.db | `%LOCALAPPDATA%\tw.proxydesk.desktop\run\` |
+| WARP 私鑰與裝置 token | Windows 認證管理員（`ProxyDesk` / `node-<tag>`） |
+| sing-box 工作目錄（cache.db），只有系統管理員能寫入。產生的設定（含帳密）經 stdin 傳給 sing-box，不寫入磁碟 | `%ProgramData%\ProxyDesk\run\` |

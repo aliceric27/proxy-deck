@@ -1,25 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, Cloud, Gauge, Loader2, Plus, RefreshCw, Search, Server, Trash2 } from "lucide-react";
-import { api, errorText, type MudfishNode, type ProxyNode } from "../lib/ipc";
+import { api, errorText, type NodeEntry } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { countryName, latencyTone } from "../lib/format";
-import { Badge, Button, cx, EmptyState, IconButton, Input, PageHeader, Select } from "../components/ui";
-
-const MUDFISH_SOCKS_PORT = 18081;
-
-/** Mirrors `MudfishNode::to_proxy_node` in proxy-core. */
-function toProxyNode(n: MudfishNode): ProxyNode {
-  const name = n.city ? (n.provider ? `${n.country} ${n.city} - ${n.provider}` : `${n.country} ${n.city}`) : n.location;
-  return { tag: `mudfish-${n.sid}`, sid: n.sid, name, server: n.ip, port: MUDFISH_SOCKS_PORT, country: n.country, udp: true };
-}
+import { Badge, Button, cx, EmptyState, IconButton, Input, Modal, PageHeader, Select } from "../components/ui";
 
 type SortKey = "location" | "latency";
 
 export default function Nodes() {
-  const { profile, core, updateProfile, patchLocal, toast } = useApp();
+  const { profile, core, updateProfile, toast } = useApp();
   const running = core.state === "running";
   const [creatingWarp, setCreatingWarp] = useState(false);
-  const [nodes, setNodes] = useState<MudfishNode[]>([]);
+  const [confirmWarp, setConfirmWarp] = useState(false);
+  const [nodes, setNodes] = useState<NodeEntry[]>([]);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
@@ -64,7 +57,7 @@ export default function Nodes() {
         (!q || [n.location, n.ip, n.hostname, countryName(n.country)].some((s) => s.toLowerCase().includes(q))),
     );
     if (sort === "latency") {
-      const v = (n: MudfishNode) => (n.ip in latency ? (latency[n.ip] ?? 99999) : 100000);
+      const v = (n: NodeEntry) => (n.ip in latency ? (latency[n.ip] ?? 99999) : 100000);
       list.sort((a, b) => v(a) - v(b));
     }
     return list;
@@ -73,13 +66,12 @@ export default function Nodes() {
   if (!profile) return null;
   const selectedTags = new Set(profile.nodes.map((n) => n.tag));
 
-  const toggle = (n: MudfishNode) => {
-    const tag = `mudfish-${n.sid}`;
+  // Decided against the latest profile inside the update, so fast double clicks cannot add twice.
+  const toggle = (n: NodeEntry) =>
     updateProfile((p) => ({
       ...p,
-      nodes: selectedTags.has(tag) ? p.nodes.filter((x) => x.tag !== tag) : [...p.nodes, toProxyNode(n)],
+      nodes: p.nodes.some((x) => x.tag === n.proxy.tag) ? p.nodes.filter((x) => x.tag !== n.proxy.tag) : [...p.nodes, n.proxy],
     }));
-  };
 
   const ping = async () => {
     const targets = visible.slice(0, 300).map((n) => n.ip);
@@ -97,11 +89,14 @@ export default function Nodes() {
   };
 
   const createWarp = async () => {
+    setConfirmWarp(false);
     setCreatingWarp(true);
     try {
-      const next = await api.warpCreate();
-      patchLocal(() => next);
-      const n = next.nodes[next.nodes.length - 1];
+      const n = await api.warpCreate();
+      if (!(await updateProfile((p) => ({ ...p, nodes: [...p.nodes, n] })))) {
+        await api.warpDiscard(n.tag).catch(() => {}); // best effort: never saved, do not leave the device registered
+        return;
+      }
       toast(`已產生「${n.name}」（${n.wireguard?.address_v4}），可設為預設節點或在群組中選用。`, "success");
     } catch (e) {
       toast(errorText(e), "error");
@@ -240,14 +235,14 @@ export default function Nodes() {
           <div className="border-b border-border px-4 py-3">
             <Button
               className="w-full"
-              onClick={createWarp}
+              onClick={() => setConfirmWarp(true)}
               disabled={creatingWarp}
               icon={creatingWarp ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
               title="向 Cloudflare 註冊一個新的免費 WARP 裝置，產生 WireGuard 節點"
             >
               產生 WARP 節點
             </Button>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-muted">每次產生都會註冊一個新的 Cloudflare WARP 免費裝置。金鑰存在 Windows 認證管理員，移除節點時一併刪除。</p>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-muted">每次產生都會註冊一個新的 Cloudflare WARP 免費裝置。金鑰存在 Windows 認證管理員；移除節點時會向 Cloudflare 註銷該裝置並刪除金鑰。</p>
           </div>
           {profile.nodes.length === 0 ? (
             <EmptyState icon={<Plus size={24} />} title="尚未加入節點">
@@ -287,6 +282,25 @@ export default function Nodes() {
           )}
         </aside>
       </div>
+      {confirmWarp && (
+        <Modal
+          title="產生 WARP 節點"
+          width={460}
+          onClose={() => setConfirmWarp(false)}
+          footer={
+            <>
+              <Button onClick={() => setConfirmWarp(false)}>取消</Button>
+              <Button variant="primary" onClick={createWarp}>
+                註冊並產生
+              </Button>
+            </>
+          }
+        >
+          <p className="px-4 py-3 text-[13px] leading-relaxed">
+            會向 Cloudflare 註冊一個新的免費 WARP 裝置（每按一次一個），使用時需遵守 Cloudflare 的服務條款。之後移除這個節點時，ProxyDesk 會一併註銷該裝置。
+          </p>
+        </Modal>
+      )}
     </div>
   );
 }

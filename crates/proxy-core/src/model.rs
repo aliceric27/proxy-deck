@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// v2: rules became groups (several matcher kinds per group, own outbound each).
 pub const PROFILE_SCHEMA_VERSION: u32 = 2;
@@ -11,8 +14,9 @@ pub const TAG_AUTO: &str = "auto";
 pub const TAG_DIRECT: &str = "direct";
 
 /// Everything the user configures. Persisted as JSON; credentials are never stored here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(default)]
+#[ts(export)]
 pub struct Profile {
     pub schema_version: u32,
     /// Nodes the user picked from the Mudfish list; order is display order.
@@ -28,8 +32,11 @@ pub struct Profile {
     pub mode: Mode,
     pub dns: DnsSettings,
     pub tun: TunSettings,
+    /// sing-box log level; `info` logs every connection and DNS query.
+    pub log_level: LogLevel,
     /// v1 `rules`, read only to migrate them into `groups`.
     #[serde(rename = "rules", default, skip_serializing)]
+    #[ts(skip)]
     pub(crate) legacy_rules: Vec<legacy::Rule>,
 }
 
@@ -44,12 +51,14 @@ impl Default for Profile {
             mode: Mode::Rule,
             dns: DnsSettings::default(),
             tun: TunSettings::default(),
+            log_level: LogLevel::default(),
             legacy_rules: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
 pub struct ProxyNode {
     /// sing-box outbound/endpoint tag, unique within the profile (`mudfish-591`, `warp-1a2b3c4d`).
     pub tag: String,
@@ -67,6 +76,7 @@ pub struct ProxyNode {
     /// Present for Cloudflare WARP (WireGuard) nodes; absent means Mudfish SOCKS5.
     /// The private key is not stored here (Windows Credential Manager, keyed by `tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub wireguard: Option<WireguardPeer>,
 }
 
@@ -77,7 +87,8 @@ impl ProxyNode {
 }
 
 /// Public half of a WireGuard (WARP) device registration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
 pub struct WireguardPeer {
     pub peer_public_key: String,
     /// Interface addresses assigned by the server, without prefix length.
@@ -90,8 +101,9 @@ pub struct WireguardPeer {
     pub mtu: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum Target {
     Proxy,
     #[default]
@@ -99,7 +111,8 @@ pub enum Target {
     Reject,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
 pub enum Mode {
     #[default]
     Rule,
@@ -118,9 +131,43 @@ impl Mode {
     }
 }
 
-/// What to do with the UDP traffic of a group routed to the proxy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    #[default]
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+/// The parts of a profile that the running core applies live through the Clash API.
+/// Everything else in the profile only takes effect on the next start.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Selections {
+    pub mode: Mode,
+    /// Choice of the default-node (`proxy`) selector.
+    pub default_node: String,
+    /// Selector tag of each enabled proxied group → its outbound.
+    pub groups: BTreeMap<String, String>,
+}
+
+/// What to do with the UDP traffic of a group routed to the proxy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum UdpPolicy {
     /// Same target as the group.
     #[default]
@@ -131,7 +178,8 @@ pub enum UdpPolicy {
 
 /// A routing group: traffic matching *any* of its matchers (apps, domains, rule sets,
 /// IP ranges) goes to the group's target. Groups are tried in priority order.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
 pub struct RuleGroup {
     pub id: String,
     pub name: String,
@@ -203,8 +251,9 @@ impl RuleGroup {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(default)]
+#[ts(export)]
 pub struct DnsSettings {
     /// Proxied domains resolve to fake IPs so the node resolves them remotely.
     /// Required for remote resolution: sing-box hands SOCKS5 the IP otherwise (verified in M0).
@@ -223,8 +272,9 @@ impl Default for DnsSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(default)]
+#[ts(export)]
 pub struct TunSettings {
     pub mtu: u32,
     /// Windows: prevents DNS leaks from multihomed resolution; may break e.g. VirtualBox.
@@ -279,6 +329,20 @@ impl Profile {
             &g.outbound
         } else {
             TAG_PROXY
+        }
+    }
+
+    /// Effective live choices (stale references already resolved to their fallbacks).
+    pub fn selections(&self) -> Selections {
+        Selections {
+            mode: self.mode,
+            default_node: self.effective_selected().to_string(),
+            groups: self
+                .groups
+                .iter()
+                .filter(|g| g.enabled && g.target == Target::Proxy)
+                .map(|g| (g.selector_tag(), self.effective_group_outbound(g).to_string()))
+                .collect(),
         }
     }
 
@@ -406,6 +470,26 @@ mod tests {
         let mut p = Profile::default();
         assert!(!p.migrate());
         assert_eq!(p.groups.len(), 1);
+    }
+
+    #[test]
+    fn selections_cover_enabled_proxied_groups_only() {
+        let mut p = Profile { selected: "gone".into(), mode: Mode::Global, ..Profile::default() };
+        let mut a = RuleGroup::new("a", "a", Target::Proxy);
+        a.outbound = TAG_AUTO.into();
+        let mut off = RuleGroup::new("off", "off", Target::Proxy);
+        off.enabled = false;
+        p.groups = vec![a, off, RuleGroup::new("d", "d", Target::Direct)];
+        let s = p.selections();
+        assert_eq!(s.mode, Mode::Global);
+        assert_eq!(s.default_node, TAG_AUTO, "stale default falls back to auto");
+        assert_eq!(s.groups, BTreeMap::from([("group-a".to_string(), TAG_AUTO.to_string())]));
+    }
+
+    #[test]
+    fn log_level_defaults_to_warn_for_old_profiles() {
+        let p: Profile = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.log_level, LogLevel::Warn);
     }
 
     #[test]

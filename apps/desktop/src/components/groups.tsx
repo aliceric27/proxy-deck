@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { AppWindow, Globe, Layers, Network } from "lucide-react";
-import { api, errorText, type ClashProxy, type Profile, type RuleGroup, type Target } from "../lib/ipc";
+import type { ClashProxy, Profile, RuleGroup, Target } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { newId } from "../lib/format";
 import { Badge, Select } from "./ui";
@@ -113,21 +113,13 @@ export function OutboundSelect({ profile, value, onChange, className }: { profil
   return <Select label="出口節點" value={known ? value : "proxy"} onChange={onChange} options={options} className={className} />;
 }
 
-/** Default-node dropdown; switches live when connected and persists either way. */
+/** Default-node dropdown; the backend switches a running core live. */
 export function DefaultNodeSelect({ className, onChanged }: { className?: string; onChanged?: () => void }) {
-  const { profile, patchLocal, toast } = useApp();
+  const { profile, updateProfile } = useApp();
   if (!profile) return null;
   const options = defaultNodeOptions(profile);
   const value = options.some((o) => o.value === profile.selected) ? profile.selected : "auto";
-  const select = async (tag: string) => {
-    try {
-      await api.select(tag);
-      patchLocal((p) => ({ ...p, selected: tag }));
-      onChanged?.();
-    } catch (e) {
-      toast(errorText(e), "error");
-    }
-  };
+  const select = (tag: string) => updateProfile((p) => ({ ...p, selected: tag })).then(onChanged);
   return <Select label="預設節點" value={value} onChange={select} options={options} className={className} />;
 }
 

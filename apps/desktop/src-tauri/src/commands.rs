@@ -1,21 +1,43 @@
-//! Tauri commands invoked by the frontend (`src/lib/ipc.ts` mirrors these signatures).
+//! Tauri commands invoked by the frontend. Argument and result types derive `ts_rs::TS`;
+//! `cargo test` regenerates their TypeScript in `apps/desktop/src/lib/bindings/`.
 
-use proxy_core::{Mode, Profile};
+use std::collections::BTreeMap;
+
+use proxy_core::singbox::restart_fingerprint;
+use proxy_core::{Profile, ProxyNode};
 use serde::Serialize;
-use serde_json::Value;
 use tauri::State;
+use ts_rs::TS;
 
-use crate::core::CoreStatus;
+use crate::clash::ClashProxy;
+use crate::core::{CoreStatus, LogBatch};
 use crate::credentials::{self, Credentials};
-use crate::nodes::{self, NodeCache, PingResult};
+use crate::nodes::{self, NodeList, PingResult};
 use crate::system::{self, ProcessInfo, RuleSetCatalog};
 use crate::AppState;
 
 type CmdResult<T> = Result<T, String>;
 
-#[derive(Serialize)]
+/// How the saved profile relates to the running core.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct ProfileState {
+    /// The running core lags the profile in something only a reconnect applies.
+    stale: bool,
+    /// Why the profile cannot be turned into a config (e.g. a group without matchers).
+    invalid: Option<String>,
+}
+
+async fn profile_state(state: &AppState, profile: &Profile) -> ProfileState {
+    let fingerprint = restart_fingerprint(profile, &state.paths.ruleset_dir);
+    ProfileState { stale: state.core.is_stale(fingerprint.as_deref().ok()).await, invalid: fingerprint.err() }
+}
+
+#[derive(Serialize, TS)]
+#[ts(export)]
 pub struct Snapshot {
     profile: Profile,
+    state: ProfileState,
     username: Option<String>,
     core: CoreStatus,
     elevated: bool,
@@ -25,8 +47,10 @@ pub struct Snapshot {
 
 #[tauri::command]
 pub async fn get_snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
+    let profile = state.profile.read().await.clone();
     Ok(Snapshot {
-        profile: state.profile.read().await.clone(),
+        state: profile_state(&state, &profile).await,
+        profile,
         username: credentials::load().map(|c| c.username),
         core: state.core.status().await,
         elevated: system::is_elevated(),
@@ -35,31 +59,46 @@ pub async fn get_snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
     })
 }
 
-/// Persists the profile. Returns whether the running core must restart for it to take effect.
+/// The single write path for the profile. Persists it, applies live-switchable choices
+/// (default node, group outbounds, mode) to a running core, and reports what still needs a
+/// reconnect.
 #[tauri::command]
-pub async fn save_profile(state: State<'_, AppState>, profile: Profile) -> CmdResult<bool> {
-    crate::store::save(&state.paths.profile_file(), &profile)?;
-    let mut current = state.profile.write().await;
-    // Drop the stored keys of WARP nodes the user removed.
-    for old in current.nodes.iter().filter(|n| n.is_wireguard()) {
-        if profile.node(&old.tag).is_none() {
-            credentials::delete_node_secret(&old.tag);
-        }
+pub async fn save_profile(state: State<'_, AppState>, profile: Profile) -> CmdResult<ProfileState> {
+    let removed_warp: Vec<String> = {
+        let mut current = state.profile.write().await;
+        crate::store::save(&state.paths.profile_file(), &profile)?;
+        let removed = current
+            .nodes
+            .iter()
+            .filter(|n| n.is_wireguard() && profile.node(&n.tag).is_none())
+            .map(|n| n.tag.clone())
+            .collect();
+        *current = profile.clone();
+        removed
+    };
+    for tag in removed_warp {
+        let http = state.http.clone();
+        tauri::async_runtime::spawn(async move { crate::warp::deregister(&http, &tag).await });
     }
-    *current = profile;
-    drop(current);
-    Ok(matches!(state.core.status().await, CoreStatus::Running { .. }))
+    state.core.set_selections(profile.selections()).await.map_err(|e| format!("設定已儲存，但無法即時套用：{e}"))?;
+    Ok(profile_state(&state, &profile).await)
 }
 
-/// Registers a new Cloudflare WARP device and appends it as a node. Returns the new profile.
+/// Registers a new Cloudflare WARP device and returns its node; the caller adds it to the
+/// profile through `save_profile`.
 #[tauri::command]
-pub async fn warp_create(state: State<'_, AppState>) -> CmdResult<Profile> {
+pub async fn warp_create(state: State<'_, AppState>) -> CmdResult<ProxyNode> {
     let index = state.profile.read().await.nodes.iter().filter(|n| n.is_wireguard()).count();
-    let node = crate::warp::create(&state.http, &state.paths.sing_box, index).await?;
-    let mut p = state.profile.write().await;
-    p.nodes.push(node);
-    crate::store::save(&state.paths.profile_file(), &*p)?;
-    Ok(p.clone())
+    crate::warp::create(&state.http, &state.paths.sing_box, index).await
+}
+
+/// Unregisters a WARP device whose node never made it into the profile (save failed).
+#[tauri::command]
+pub async fn warp_discard(state: State<'_, AppState>, tag: String) -> CmdResult<()> {
+    if state.profile.read().await.node(&tag).is_none() {
+        crate::warp::deregister(&state.http, &tag).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -77,8 +116,8 @@ pub async fn clear_credentials() -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub async fn get_nodes(state: State<'_, AppState>, force: bool) -> CmdResult<NodeCache> {
-    nodes::get(&state.paths, &state.http, force).await
+pub async fn get_nodes(state: State<'_, AppState>, force: bool) -> CmdResult<NodeList> {
+    nodes::get(&state.paths, &state.http, force).await.map(NodeList::from)
 }
 
 #[tauri::command]
@@ -86,10 +125,22 @@ pub async fn ping_nodes(ips: Vec<String>) -> CmdResult<Vec<PingResult>> {
     Ok(nodes::ping(ips).await)
 }
 
+/// Starts the core with the current profile (also used by the tray).
+pub async fn start_core(state: &AppState) -> CmdResult<()> {
+    let profile = state.profile.read().await.clone();
+    let plan = crate::core::build_plan(&profile, credentials::load().as_ref(), &state.paths);
+    match plan {
+        Ok(plan) => state.core.start(plan, profile.selections()).await,
+        Err(e) => {
+            state.core.fail(e.clone()).await;
+            Err(e)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn core_start(state: State<'_, AppState>) -> CmdResult<()> {
-    let profile = state.profile.read().await.clone();
-    state.core.start(&profile, credentials::load().as_ref()).await
+    start_core(&state).await
 }
 
 #[tauri::command]
@@ -99,7 +150,7 @@ pub async fn core_stop(state: State<'_, AppState>) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub async fn core_logs(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+pub async fn core_logs(state: State<'_, AppState>) -> CmdResult<LogBatch> {
     Ok(state.core.logs())
 }
 
@@ -107,56 +158,14 @@ async fn clash(state: &State<'_, AppState>) -> CmdResult<crate::clash::ClashClie
     state.core.clash().await.ok_or_else(|| "尚未連線".to_string())
 }
 
-/// Switches the `proxy` selector (live if running) and remembers the choice.
 #[tauri::command]
-pub async fn select_outbound(state: State<'_, AppState>, tag: String) -> CmdResult<()> {
-    if let Some(c) = state.core.clash().await {
-        c.select(proxy_core::TAG_PROXY, &tag).await?;
-        // Existing connections keep their old node; drop them so traffic moves now.
-        let _ = c.close_all().await;
-    }
-    let mut p = state.profile.write().await;
-    p.selected = tag;
-    crate::store::save(&state.paths.profile_file(), &*p)
-}
-
-/// Switches one group's own selector (live if running) and remembers the choice.
-#[tauri::command]
-pub async fn select_group_outbound(state: State<'_, AppState>, group_id: String, outbound: String) -> CmdResult<()> {
-    let mut p = state.profile.write().await;
-    let group = p.groups.iter_mut().find(|g| g.id == group_id).ok_or("找不到這個群組")?;
-    if let Some(c) = state.core.clash().await {
-        c.select(&group.selector_tag(), &outbound).await?;
-        let _ = c.close_all().await;
-    }
-    group.outbound = outbound;
-    crate::store::save(&state.paths.profile_file(), &*p)
-}
-
-#[tauri::command]
-pub async fn set_mode(state: State<'_, AppState>, mode: Mode) -> CmdResult<()> {
-    if let Some(c) = state.core.clash().await {
-        c.set_mode(mode.as_clash()).await?;
-        let _ = c.close_all().await;
-    }
-    let mut p = state.profile.write().await;
-    p.mode = mode;
-    crate::store::save(&state.paths.profile_file(), &*p)
-}
-
-#[tauri::command]
-pub async fn clash_proxies(state: State<'_, AppState>) -> CmdResult<Value> {
+pub async fn clash_proxies(state: State<'_, AppState>) -> CmdResult<BTreeMap<String, ClashProxy>> {
     clash(&state).await?.proxies().await
 }
 
 #[tauri::command]
 pub async fn clash_delay(state: State<'_, AppState>, tag: String) -> CmdResult<u32> {
     clash(&state).await?.delay(&tag).await
-}
-
-#[tauri::command]
-pub async fn clash_connections(state: State<'_, AppState>) -> CmdResult<Value> {
-    clash(&state).await?.connections().await
 }
 
 #[tauri::command]

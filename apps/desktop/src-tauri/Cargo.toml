@@ -26,8 +26,9 @@ tauri-plugin-dialog = "2.8.1"
 tauri-plugin-opener = "2.7.0"
 tauri-plugin-single-instance = "2.5.2"
 thiserror.workspace = true
+ts-rs.workspace = true
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "sync", "net"] }
 uuid = { version = "1.27.0", features = ["v4"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

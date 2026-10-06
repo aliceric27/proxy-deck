@@ -28,7 +28,13 @@ pub struct GenerateOptions<'a> {
     /// `127.0.0.1:<port>`
     pub clash_listen: &'a str,
     pub clash_secret: &'a str,
-    pub log_level: &'a str,
+    /// Fresh per start. sing-box's cache file restores each selector's last choice and the
+    /// Clash mode under this id, overriding `default`/`default_mode`; a new id makes every
+    /// start follow the profile. FakeIP mappings are not keyed by it and survive restarts.
+    pub cache_id: &'a str,
+    /// This app's executable: its own traffic (node list, WARP registration, TCP ping)
+    /// always goes direct, also in Global mode.
+    pub self_exe: Option<&'a str>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -69,21 +75,66 @@ pub fn generate(profile: &Profile, opts: &GenerateOptions) -> Result<Value, Gene
     let rule_sets = collect_rule_sets(&groups, opts.ruleset_dir)?;
 
     Ok(json!({
-        "log": { "level": opts.log_level, "timestamp": true },
+        "log": { "level": profile.log_level.as_str(), "timestamp": true },
         "dns": dns(profile, &groups),
         "inbounds": [tun(&profile.tun)],
         "outbounds": outbounds(profile, &groups, opts),
         "endpoints": endpoints(profile, opts),
-        "route": route(profile, &groups, rule_sets),
+        "route": route(profile, &groups, rule_sets, opts.self_exe),
         "experimental": {
             "clash_api": {
                 "external_controller": opts.clash_listen,
                 "secret": opts.clash_secret,
                 "default_mode": profile.mode.as_clash(),
             },
-            "cache_file": { "enabled": true, "path": "cache.db", "store_fakeip": profile.dns.fakeip },
+            "cache_file": { "enabled": true, "path": "cache.db", "cache_id": opts.cache_id, "store_fakeip": profile.dns.fakeip },
         },
     }))
+}
+
+/// Everything in the generated config that only takes effect when the core restarts. Two
+/// profiles with the same fingerprint differ at most in their `Selections` (default node,
+/// group outbounds, mode), which the running core applies live through the Clash API.
+/// `Err` carries why the profile cannot become a config at all.
+pub fn restart_fingerprint(profile: &Profile, ruleset_dir: &Path) -> Result<String, String> {
+    let keys: BTreeMap<String, String> =
+        profile.nodes.iter().filter(|n| n.is_wireguard()).map(|n| (n.tag.clone(), String::new())).collect();
+    let opts = GenerateOptions {
+        username: "-",
+        password: "-",
+        wireguard_keys: &keys,
+        ruleset_dir,
+        clash_listen: "",
+        clash_secret: "",
+        cache_id: "",
+        self_exe: None,
+    };
+    match generate(profile, &opts) {
+        Ok(mut c) => {
+            for o in c["outbounds"].as_array_mut().into_iter().flatten() {
+                if o["type"] == "selector" {
+                    o.as_object_mut().map(|m| m.remove("default"));
+                }
+            }
+            c["experimental"]["clash_api"]["default_mode"] = Value::Null;
+            Ok(c.to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Selector tag → member tags of a generated config (what the Clash API can switch to).
+pub fn selector_members(config: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    config["outbounds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["type"] == "selector")
+        .filter_map(|o| {
+            let members = o["outbounds"].as_array()?.iter().filter_map(|m| m.as_str().map(String::from)).collect();
+            Some((o["tag"].as_str()?.to_string(), members))
+        })
+        .collect()
 }
 
 /// A referenced built-in rule set: `geosite:netflix` → tag `geosite-netflix`.
@@ -150,8 +201,15 @@ fn group_matchers(g: &RuleGroup) -> Vec<Value> {
         }
     };
     single("process_name", &g.process_names);
-    single("process_path", &g.process_paths);
-    let regexes: Vec<String> = g.directories.iter().filter(|d| !d.trim().is_empty()).map(|d| directory_regex(d)).collect();
+    // Exact paths and directories both become case-insensitive regexes: Windows paths are
+    // case-insensitive, and a path typed by hand may differ in case from the one sing-box reports.
+    let regexes: Vec<String> = g
+        .process_paths
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| path_regex(p))
+        .chain(g.directories.iter().filter(|d| !d.trim().is_empty()).map(|d| directory_regex(d)))
+        .collect();
     single("process_path_regex", &regexes);
     single("ip_cidr", &g.ip_cidrs);
     single("rule_set", &rule_set_tags(&g.rule_sets, false));
@@ -188,7 +246,8 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
         }));
     }
 
-    let mut dns_rules = Vec::new();
+    // Direct mode sends everything out directly, so resolve locally instead of faking.
+    let mut dns_rules = vec![json!({ "clash_mode": "Direct", "action": "route", "server": DNS_LOCAL })];
     if fake {
         dns_rules.push(json!({ "clash_mode": "Global", "query_type": ["A", "AAAA"], "action": "route", "server": DNS_FAKEIP }));
     }
@@ -206,6 +265,11 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
             dns_rules.push(json!({ "query_type": ["A", "AAAA"], "rule_set": tags, "action": "route", "server": proxied_server }));
         }
     }
+
+    // sing-box only accepts Clash modes that some rule mentions (plus `default_mode`). The
+    // route rules name Direct and Global; without this no-op (same server as `final`), a core
+    // started in Global or Direct mode could never be switched to Rule live.
+    dns_rules.push(json!({ "clash_mode": "Rule", "action": "route", "server": DNS_LOCAL }));
 
     let mut dns = json!({ "servers": servers, "rules": dns_rules, "final": DNS_LOCAL });
     if profile.dns.ipv4_only {
@@ -313,21 +377,25 @@ fn endpoints(profile: &Profile, opts: &GenerateOptions) -> Value {
     Value::Array(eps)
 }
 
-fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRef>) -> Value {
+fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRef>, self_exe: Option<&str>) -> Value {
     let mut out = vec![
         json!({ "action": "sniff", "sniffer": ["http", "tls", "quic", "dns", "stun"], "timeout": "300ms" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
-        json!({ "clash_mode": "Direct", "action": "route", "outbound": TAG_DIRECT }),
-        json!({ "clash_mode": "Global", "action": "route", "outbound": TAG_PROXY }),
     ];
+    // Exceptions that hold in every mode come before the mode switches.
+    if let Some(exe) = self_exe {
+        out.push(json!({ "process_path_regex": [path_regex(exe)], "action": "route", "outbound": TAG_DIRECT }));
+    }
     if profile.tun.bypass_lan {
         out.push(json!({ "ip_is_private": true, "action": "route", "outbound": TAG_DIRECT }));
     }
-    if profile.dns.block_quic_for_proxied {
-        out.extend(quic_blocks(groups));
-    }
+    out.push(json!({ "clash_mode": "Direct", "action": "route", "outbound": TAG_DIRECT }));
+    out.push(json!({ "clash_mode": "Global", "action": "route", "outbound": TAG_PROXY }));
 
     for g in groups {
+        if profile.dns.block_quic_for_proxied {
+            out.extend(quic_block(g));
+        }
         let matcher = any_of(group_matchers(g));
         if g.target == Target::Proxy && g.udp != UdpPolicy::Follow {
             let mut udp_rule = json!({ "type": "logical", "mode": "and", "rules": [{ "network": ["udp"] }, matcher.clone()] });
@@ -368,34 +436,30 @@ fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRe
     })
 }
 
-/// Rejects UDP 443 to proxied domains, so browsers retry over TCP through the proxy. Must
-/// precede the group rules (first match wins). Domains and rule sets get separate rules
-/// because `rule_set` is ANDed with the domain fields inside a single rule.
-fn quic_blocks(groups: &[&RuleGroup]) -> Vec<Value> {
-    let proxied: Vec<&&RuleGroup> = groups.iter().filter(|g| g.target == Target::Proxy).collect();
-    let suffixes: Vec<String> = proxied.iter().flat_map(|g| g.domain_suffixes.iter().cloned()).collect();
-    let keywords: Vec<String> = proxied.iter().flat_map(|g| g.domain_keywords.iter().cloned()).collect();
-    let sets: Vec<String> = proxied.iter().flat_map(|g| rule_set_tags(&g.rule_sets, true)).collect();
-
-    let mut out = Vec::new();
-    let mut base = Map::new();
-    base.insert("network".into(), json!(["udp"]));
-    base.insert("port".into(), json!([443]));
-
-    let mut dom = base.clone();
-    put_list(&mut dom, "domain_suffix", &suffixes);
-    put_list(&mut dom, "domain_keyword", &keywords);
-    if dom.len() > base.len() {
-        dom.insert("action".into(), json!("reject"));
-        out.push(Value::Object(dom));
+/// Rejects UDP 443 to a proxied group's domains, so browsers retry over TCP through the
+/// proxy. Emitted right before the group's own rule, so a higher-priority group that sends the
+/// same domain direct still wins. Domains and rule sets are separate sub-rules because
+/// `rule_set` is ANDed with the domain fields inside a single rule. Groups with their own UDP
+/// policy keep it (UDP direct lets QUIC work directly; UDP reject already covers it).
+fn quic_block(g: &RuleGroup) -> Option<Value> {
+    if g.target != Target::Proxy || g.udp != UdpPolicy::Follow {
+        return None;
     }
-    let mut rs = base;
-    put_list(&mut rs, "rule_set", &sets);
-    if rs.contains_key("rule_set") {
-        rs.insert("action".into(), json!("reject"));
-        out.push(Value::Object(rs));
+    let mut subs = Vec::new();
+    if let Some(d) = domain_rule(g) {
+        subs.push(Value::Object(d));
     }
-    out
+    let sets = rule_set_tags(&g.rule_sets, true);
+    if !sets.is_empty() {
+        subs.push(json!({ "rule_set": sets }));
+    }
+    (!subs.is_empty()).then(|| {
+        json!({
+            "type": "logical", "mode": "and",
+            "rules": [{ "network": ["udp"], "port": [443] }, any_of(subs)],
+            "action": "reject",
+        })
+    })
 }
 
 enum Action {
@@ -426,17 +490,26 @@ fn put_list(m: &mut Map<String, Value>, key: &str, items: &[String]) {
     }
 }
 
-/// `C:\Games\LoL` → `(?i)^C:\\Games\\LoL\\.+$` (Windows paths are case-insensitive).
-fn directory_regex(dir: &str) -> String {
-    let dir = dir.trim().trim_end_matches(['\\', '/']);
-    let mut escaped = String::with_capacity(dir.len() * 2);
-    for c in dir.chars() {
+/// Regex-escapes a Windows path, accepting `/` as a separator (sing-box reports `\`).
+fn escape_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len() * 2);
+    for c in path.trim().chars().map(|c| if c == '/' { '\\' } else { c }) {
         if "\\.+*?()|[]{}^$".contains(c) {
             escaped.push('\\');
         }
         escaped.push(c);
     }
-    format!(r"(?i)^{escaped}\\.+$")
+    escaped
+}
+
+/// `C:\Games\game.exe` → `(?i)^C:\\Games\\game\.exe$`.
+fn path_regex(path: &str) -> String {
+    format!("(?i)^{}$", escape_path(path))
+}
+
+/// `C:\Games\LoL` → `(?i)^C:\\Games\\LoL\\.+$` (any executable below it).
+fn directory_regex(dir: &str) -> String {
+    format!(r"(?i)^{}\\.+$", escape_path(dir.trim().trim_end_matches(['\\', '/'])))
 }
 
 #[cfg(test)]
@@ -494,7 +567,8 @@ mod tests {
             ruleset_dir: dir,
             clash_listen: "127.0.0.1:19090",
             clash_secret: "secret",
-            log_level: "info",
+            cache_id: "run-1",
+            self_exe: None,
         }
     }
 
@@ -584,36 +658,49 @@ mod tests {
     fn mixed_group_is_logical_or_of_separate_matchers() {
         let c = generate(&sample_profile(), &opts(&ruleset_dir())).unwrap();
         let r = rules(&c);
-        // sniff, hijack-dns, 2× clash_mode, bypass LAN, 2× QUIC block
-        assert_eq!(r[5]["domain_suffix"], json!(["riotgames.com", "ifconfig.me"]));
-        assert_eq!(r[5]["port"], json!([443]));
-        assert_eq!(r[6]["rule_set"], json!(["geosite-category-games"]));
-        assert!(r[6].get("domain_suffix").is_none(), "rule_set and domains must not share a rule (AND)");
+        // sniff, hijack-dns, bypass LAN, then the two mode switches
+        assert_eq!(r[2], json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
+        assert_eq!(r[3]["clash_mode"], "Direct");
+        assert_eq!(r[4]["clash_mode"], "Global");
 
-        assert_eq!(r[7]["rule_set"], json!(["geosite-category-ads-all"]));
-        assert_eq!(r[7]["action"], "reject");
+        assert_eq!(r[5], json!({ "rule_set": ["geosite-category-ads-all"], "action": "reject" }));
 
-        // game: UDP-direct guard first, then the OR rule to its own selector
-        assert_eq!(r[8]["mode"], "and");
-        assert_eq!(r[8]["outbound"], "direct");
-        assert_eq!(r[8]["rules"][1]["mode"], "or");
-        let game = &r[9];
+        // game: UDP-direct guard first (no QUIC block: its UDP already goes direct), then the OR rule
+        assert_eq!(r[6]["mode"], "and");
+        assert_eq!(r[6]["outbound"], "direct");
+        assert_eq!(r[6]["rules"][1]["mode"], "or");
+        let game = &r[7];
         assert_eq!(game["type"], "logical");
         assert_eq!(game["mode"], "or");
         assert_eq!(game["outbound"], "group-game");
         let subs = game["rules"].as_array().unwrap();
-        assert_eq!(subs.len(), 4, "name, path, directory regex and domain are separate");
+        assert_eq!(subs.len(), 3, "name, path regexes and domain are separate sub-rules");
         assert_eq!(subs[0], json!({ "process_name": ["Game.exe"] }));
-        assert_eq!(subs[1], json!({ "process_path": [r"C:\Program Files\Game\Game.exe"] }));
-        assert_eq!(subs[2], json!({ "process_path_regex": [r"(?i)^C:\\Riot Games\\.+$"] }));
-        assert_eq!(subs[3], json!({ "domain_suffix": ["riotgames.com"] }));
+        assert_eq!(
+            subs[1],
+            json!({ "process_path_regex": [r"(?i)^C:\\Program Files\\Game\\Game\.exe$", r"(?i)^C:\\Riot Games\\.+$"] })
+        );
+        assert_eq!(subs[2], json!({ "domain_suffix": ["riotgames.com"] }));
 
-        // single-kind groups stay plain rules
-        assert_eq!(r[10], json!({ "domain_suffix": ["ifconfig.me"], "action": "route", "outbound": "group-site" }));
+        // site: its own QUIC block right before its rule
+        assert_eq!(
+            r[8],
+            json!({ "type": "logical", "mode": "and", "action": "reject",
+                    "rules": [{ "network": ["udp"], "port": [443] }, { "domain_suffix": ["ifconfig.me"] }] })
+        );
+        assert_eq!(r[9], json!({ "domain_suffix": ["ifconfig.me"], "action": "route", "outbound": "group-site" }));
+        // games: only the geosite set takes part in QUIC blocking (geoip sets are IP lists)
+        assert_eq!(r[10]["rules"][1], json!({ "rule_set": ["geosite-category-games"] }));
         assert_eq!(r[11], json!({ "rule_set": ["geosite-category-games", "geoip-jp"], "action": "route", "outbound": "group-games" }));
         assert_eq!(r[12], json!({ "ip_cidr": ["100.64.0.0/10"], "action": "route", "outbound": "direct" }));
+        assert_eq!(r.len(), 13);
         assert_eq!(c["route"]["final"], "direct");
         assert_eq!(c["route"]["rule_set"].as_array().unwrap().len(), 3);
+    }
+
+    /// Outbounds of the group rules in order (skips QUIC blocks and the fixed prefix).
+    fn group_outbounds(c: &Value) -> Vec<String> {
+        rules(c)[5..].iter().filter_map(|r| r["outbound"].as_str().map(String::from)).collect()
     }
 
     #[test]
@@ -621,28 +708,132 @@ mod tests {
         let mut p = sample_profile();
         p.groups.swap(2, 4); // lan before site
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        let outs: Vec<&Value> = rules(&c)[10..].iter().map(|r| &r["outbound"]).collect();
-        assert_eq!(outs, [&json!("direct"), &json!("group-games"), &json!("group-site")]);
+        assert_eq!(group_outbounds(&c), ["direct", "group-game", "direct", "group-games", "group-site"]);
+    }
+
+    #[test]
+    fn quic_block_respects_group_priority() {
+        // A higher-priority direct group for youtube.com must not lose QUIC to a lower proxied one.
+        let mut yt = RuleGroup::new("yt", "yt", Target::Direct);
+        yt.domain_suffixes = vec!["youtube.com".into()];
+        let mut google = RuleGroup::new("google", "google", Target::Proxy);
+        google.domain_suffixes = vec!["youtube.com".into(), "google.com".into()];
+        let p = Profile { nodes: vec![node(591)], groups: vec![yt, google], ..Profile::default() };
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+        let r = rules(&c);
+        let yt_rule = r.iter().position(|x| x["domain_suffix"] == json!(["youtube.com"])).unwrap();
+        let quic = r.iter().position(|x| x["action"] == "reject" && x["type"] == "logical").unwrap();
+        assert!(yt_rule < quic, "direct group decides before the proxied group's QUIC block");
+
+        let mut p = p;
+        p.dns.block_quic_for_proxied = false;
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+        assert!(rules(&c).iter().all(|x| x["action"] != "reject"));
+    }
+
+    #[test]
+    fn exceptions_precede_mode_switches() {
+        let dir = ruleset_dir();
+        let mut o = opts(&dir);
+        o.self_exe = Some(r"C:\Program Files\ProxyDesk\proxydesk.exe");
+        let c = generate(&sample_profile(), &o).unwrap();
+        let r = rules(&c);
+        assert_eq!(r[2], json!({ "process_path_regex": [r"(?i)^C:\\Program Files\\ProxyDesk\\proxydesk\.exe$"], "action": "route", "outbound": "direct" }));
+        assert_eq!(r[3]["ip_is_private"], true, "LAN stays direct in Global mode too");
+        assert_eq!(r[4]["clash_mode"], "Direct");
+        assert_eq!(r[5]["clash_mode"], "Global");
+    }
+
+    #[test]
+    fn path_regexes_accept_forward_slashes() {
+        assert_eq!(path_regex("C:/Games/a+b.exe"), r"(?i)^C:\\Games\\a\+b\.exe$");
+        assert_eq!(directory_regex("C:/Games/"), r"(?i)^C:\\Games\\.+$");
     }
 
     #[test]
     fn dns_uses_fakeip_only_for_proxied_domains() {
         let c = generate(&sample_profile(), &opts(&ruleset_dir())).unwrap();
         let r = c["dns"]["rules"].as_array().unwrap();
-        assert_eq!(r[0]["clash_mode"], "Global");
-        assert_eq!(r[1]["domain_suffix"], json!(["riotgames.com"]));
-        assert_eq!(r[2]["domain_suffix"], json!(["ifconfig.me"]));
-        assert_eq!(r[3]["rule_set"], json!(["geosite-category-games"]));
-        assert!(r[1..].iter().all(|x| x["server"] == "dns-fakeip"));
-        assert_eq!(r.len(), 4, "reject/direct groups and geoip sets stay out of DNS rules");
+        assert_eq!(r[0], json!({ "clash_mode": "Direct", "action": "route", "server": "dns-local" }));
+        assert_eq!(r[1]["clash_mode"], "Global");
+        assert_eq!(r[2]["domain_suffix"], json!(["riotgames.com"]));
+        assert_eq!(r[3]["domain_suffix"], json!(["ifconfig.me"]));
+        assert_eq!(r[4]["rule_set"], json!(["geosite-category-games"]));
+        assert!(r[1..5].iter().all(|x| x["server"] == "dns-fakeip"));
+        assert_eq!(r[5], json!({ "clash_mode": "Rule", "action": "route", "server": "dns-local" }));
+        assert_eq!(r.len(), 6, "reject/direct groups and geoip sets stay out of DNS rules");
         assert_eq!(c["dns"]["strategy"], "ipv4_only");
 
         let mut p = sample_profile();
         p.dns.fakeip = false;
         p.dns.ipv4_only = false;
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        assert_eq!(c["dns"]["rules"][0]["server"], "dns-remote");
+        assert_eq!(c["dns"]["rules"][1]["server"], "dns-remote");
         assert!(c["dns"].get("strategy").is_none());
+    }
+
+    /// sing-box builds its switchable mode list from the `clash_mode` values in the rules.
+    #[test]
+    fn every_mode_is_switchable_whatever_the_start_mode() {
+        for start in [Mode::Rule, Mode::Global, Mode::Direct] {
+            let p = Profile { mode: start, ..sample_profile() };
+            let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+            let text = c.to_string();
+            for m in ["Rule", "Global", "Direct"] {
+                assert!(text.contains(&format!(r#""clash_mode":"{m}""#)), "{m} missing when starting in {start:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cache_id_and_log_level_come_from_options_and_profile() {
+        let mut p = sample_profile();
+        p.log_level = LogLevel::Info;
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+        assert_eq!(c["experimental"]["cache_file"]["cache_id"], "run-1");
+        assert_eq!(c["log"]["level"], "info");
+    }
+
+    #[test]
+    fn fingerprint_ignores_live_selections_only() {
+        let dir = ruleset_dir();
+        let base = sample_profile();
+        let fp = restart_fingerprint(&base, &dir);
+
+        let mut live = base.clone();
+        live.selected = TAG_DIRECT.into();
+        live.mode = Mode::Global;
+        live.groups[1].outbound = TAG_AUTO.into();
+        live.groups[1].name = "renamed".into();
+        assert_eq!(restart_fingerprint(&live, &dir), fp, "selections and names apply without a restart");
+
+        let mut off = base.clone();
+        off.groups.push(RuleGroup::new("idle", "idle", Target::Proxy));
+        off.groups.last_mut().unwrap().enabled = false;
+        assert_eq!(restart_fingerprint(&off, &dir), fp, "editing a disabled group needs no restart");
+
+        for change in [
+            |p: &mut Profile| p.groups[2].domain_suffixes.push("example.com".into()),
+            |p: &mut Profile| p.groups.swap(2, 3),
+            |p: &mut Profile| p.final_target = Target::Proxy,
+            |p: &mut Profile| p.log_level = LogLevel::Debug,
+            |p: &mut Profile| p.nodes.pop().map(|_| ()).unwrap(),
+        ] {
+            let mut p = base.clone();
+            change(&mut p);
+            assert_ne!(restart_fingerprint(&p, &dir), fp);
+        }
+        let mut bad = base.clone();
+        bad.groups.push(RuleGroup::new("empty", "empty", Target::Proxy));
+        assert_eq!(restart_fingerprint(&bad, &dir), Err("群組「empty」沒有任何比對條件".to_string()));
+    }
+
+    #[test]
+    fn selector_members_list_what_can_be_switched() {
+        let c = generate(&sample_profile(), &opts(&ruleset_dir())).unwrap();
+        let m = selector_members(&c);
+        assert_eq!(m.keys().map(String::as_str).collect::<Vec<_>>(), ["group-game", "group-games", "group-site", "proxy"]);
+        assert!(m["proxy"].contains("direct") && !m["group-game"].contains("direct"));
     }
 
     #[test]
@@ -744,6 +935,7 @@ mod tests {
         let keys = warp_keys();
         let mut o = opts(&dir);
         o.wireguard_keys = &keys;
+        o.self_exe = Some(r"C:\Program Files\ProxyDesk\proxydesk.exe");
         for (fakeip, final_target, selected) in [(true, Target::Direct, "auto"), (false, Target::Proxy, "direct"), (true, Target::Reject, "mudfish-591")] {
             p.dns.fakeip = fakeip;
             p.final_target = final_target;

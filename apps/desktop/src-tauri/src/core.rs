@@ -1,278 +1,717 @@
-//! sing-box sidecar lifecycle: generate config → `check` → spawn → health check → supervise.
+//! sing-box sidecar lifecycle: build config → `check` → spawn → health check → apply live
+//! selections → supervise (bounded auto-restart on crashes).
+//!
+//! `CoreManager` knows nothing about Tauri: process work goes through [`Launcher`] and
+//! notifications through [`CoreEvents`], so the state machine runs against fakes in tests and
+//! can later sit behind a privileged service.
 
-use std::collections::VecDeque;
-use std::process::Stdio;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proxy_core::singbox::{self, GenerateOptions};
-use proxy_core::Profile;
+use proxy_core::{Mode, Profile, Selections, TAG_PROXY};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use ts_rs::TS;
 
 use crate::clash::ClashClient;
 use crate::credentials::Credentials;
 use crate::paths::Paths;
 
 const LOG_CAPACITY: usize = 3000;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const LOG_BATCH: Duration = Duration::from_millis(250);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export)]
 pub enum CoreStatus {
     Stopped,
     Starting,
-    Running { started_at: u64 },
+    Running {
+        #[ts(type = "number")]
+        started_at: u64,
+    },
+    /// The core crashed after a successful start; restart `attempt` is scheduled.
+    Reconnecting { attempt: u32, message: String },
     Error { message: String },
 }
 
-struct Running {
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A spawned core process.
+pub struct Child {
+    /// Sending (or dropping) kills the process.
+    pub kill: oneshot::Sender<()>,
+    /// Resolves with a description once the process has exited, for whatever reason.
+    pub exit: oneshot::Receiver<String>,
+}
+
+/// A change the running core applies through the Clash API.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveOp {
+    Select { selector: String, outbound: String },
+    Mode(Mode),
+    /// Mode switches have no per-connection interrupt, unlike selectors.
+    CloseAll,
+}
+
+/// Process-level operations behind the state machine.
+pub trait Launcher: Send + Sync + 'static {
+    /// Validates a config without running it.
+    fn check<'a>(&'a self, config: &'a [u8]) -> BoxFut<'a, Result<(), String>>;
+    /// Starts the core; its output lines go to `log`.
+    fn spawn<'a>(&'a self, config: &'a [u8], log: mpsc::UnboundedSender<String>) -> BoxFut<'a, Result<Child, String>>;
+    fn healthy<'a>(&'a self, clash: &'a ClashClient) -> BoxFut<'a, bool>;
+    fn apply<'a>(&'a self, clash: &'a ClashClient, ops: &'a [LiveOp]) -> BoxFut<'a, Result<(), String>>;
+    /// After the core is gone (stopped or crashed): undo system side effects.
+    fn cleanup(&self) -> BoxFut<'_, ()>;
+    /// Kills cores left over from a previous crash of the app. Blocking.
+    fn sweep_orphans(&self);
+}
+
+pub trait CoreEvents: Send + Sync + 'static {
+    fn status(&self, status: &CoreStatus);
+    fn logs(&self, batch: &LogBatch);
+}
+
+/// Consecutive core output lines; `first` is the sequence number of `lines[0]`, so a reader
+/// can join a snapshot (`CoreManager::logs`) with later batches without gaps or duplicates.
+#[derive(Debug, Clone, Default, Serialize, TS)]
+#[ts(export)]
+pub struct LogBatch {
+    #[ts(type = "number")]
+    pub first: u64,
+    pub lines: Vec<String>,
+}
+
+/// Everything needed to (re)start the core with one profile.
+pub struct StartPlan {
+    pub config: Vec<u8>,
+    pub clash: ClashClient,
+    /// `restart_fingerprint` of the profile the config came from.
+    pub fingerprint: String,
+    /// Selector tag → member tags in this config. Live switches to anything else (a group or
+    /// node added after the start) wait for the next start instead of failing.
+    pub selectors: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Generates the config for `profile`. Secrets are read here and live only in the returned
+/// bytes, which go to sing-box over stdin and never touch the disk.
+pub fn build_plan(profile: &Profile, creds: Option<&Credentials>, paths: &Paths) -> Result<StartPlan, String> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_err(|e| format!("無法取得可用連接埠: {e}"))?
+        .port();
+    let listen = format!("127.0.0.1:{port}");
+    let secret = uuid::Uuid::new_v4().simple().to_string();
+    let cache_id = uuid::Uuid::new_v4().simple().to_string();
+    let wireguard_keys: std::collections::BTreeMap<String, String> = profile
+        .nodes
+        .iter()
+        .filter(|n| n.is_wireguard())
+        .filter_map(|n| Some((n.tag.clone(), crate::credentials::load_warp(&n.tag)?.private_key)))
+        .collect();
+    let self_exe = paths.self_exe.to_string_lossy();
+    let config = singbox::generate(
+        profile,
+        &GenerateOptions {
+            username: creds.map(|c| c.username.as_str()).unwrap_or_default(),
+            password: creds.map(|c| c.password.as_str()).unwrap_or_default(),
+            wireguard_keys: &wireguard_keys,
+            ruleset_dir: &paths.ruleset_dir,
+            clash_listen: &listen,
+            clash_secret: &secret,
+            cache_id: &cache_id,
+            self_exe: Some(&self_exe),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(StartPlan {
+        config: serde_json::to_vec(&config).map_err(|e| e.to_string())?,
+        clash: ClashClient::new(&listen, &secret),
+        fingerprint: singbox::restart_fingerprint(profile, &paths.ruleset_dir)?,
+        selectors: singbox::selector_members(&config),
+    })
+}
+
+struct Run {
     clash: ClashClient,
-    /// Dropping or sending stops the supervisor, which kills the child.
-    kill: oneshot::Sender<()>,
-    exited: oneshot::Receiver<()>,
+    kill: Option<oneshot::Sender<()>>,
+    done: oneshot::Receiver<()>,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct Inner {
+    status: Option<CoreStatus>,
+    /// Bumped by every start, restart and stop; exits of older runs are then ignored.
+    generation: u64,
+    run: Option<Run>,
+    /// Exit of a process that had not finished starting: (generation, message).
+    early_exit: Option<(u64, String)>,
+    /// The plan of the current session, kept for auto-restarts.
+    plan: Option<Arc<StartPlan>>,
+    /// Selections the profile wants; applied live and after every (re)start.
+    desired: Selections,
+    /// Selections the running core is known to have.
+    live: Option<Selections>,
+    /// A live apply failed: the core may not match the profile until it restarts.
+    live_failed: bool,
+    /// Consecutive crashes without a stable run in between.
+    crashes: u32,
 }
 
 pub struct CoreManager {
-    app: AppHandle,
-    paths: Paths,
-    status: Mutex<CoreStatus>,
-    running: Mutex<Option<Running>>,
-    logs: Arc<std::sync::Mutex<VecDeque<String>>>,
-    /// Serializes start/stop so concurrent clicks cannot spawn two cores.
+    launcher: Arc<dyn Launcher>,
+    events: Arc<dyn CoreEvents>,
+    inner: Mutex<Inner>,
+    /// Serializes start, stop and restart.
     op: Mutex<()>,
+    /// Serializes Clash API selection changes against each other and against startup.
+    live: Mutex<()>,
+    /// Recent core output and the sequence number of the line after the last one.
+    logs: std::sync::Mutex<(VecDeque<String>, u64)>,
+    log_tx: mpsc::UnboundedSender<String>,
+    log_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Delay before each automatic restart; its length is the restart budget.
+    restart_delays: Vec<Duration>,
+    /// A run lasting this long resets the crash budget.
+    stable_after: Duration,
+    health_timeout: Duration,
 }
 
 impl CoreManager {
-    pub fn new(app: AppHandle, paths: Paths) -> Self {
-        Self {
-            app,
-            paths,
-            status: Mutex::new(CoreStatus::Stopped),
-            running: Mutex::new(None),
-            logs: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(LOG_CAPACITY))),
+    pub fn new(launcher: Arc<dyn Launcher>, events: Arc<dyn CoreEvents>) -> Arc<Self> {
+        Self::with_policy(
+            launcher,
+            events,
+            vec![Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(10)],
+            Duration::from_secs(60),
+        )
+    }
+
+    fn with_policy(launcher: Arc<dyn Launcher>, events: Arc<dyn CoreEvents>, restart_delays: Vec<Duration>, stable_after: Duration) -> Arc<Self> {
+        let (log_tx, log_rx) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            launcher,
+            events,
+            inner: Mutex::new(Inner { status: Some(CoreStatus::Stopped), ..Inner::default() }),
             op: Mutex::new(()),
+            live: Mutex::new(()),
+            logs: std::sync::Mutex::new((VecDeque::with_capacity(LOG_CAPACITY), 0)),
+            log_tx,
+            log_rx: std::sync::Mutex::new(Some(log_rx)),
+            sweep: Mutex::new(None),
+            restart_delays,
+            stable_after,
+            health_timeout: HEALTH_TIMEOUT,
+        })
+    }
+
+    /// Starts the orphan sweep in the background; the first start waits for it.
+    pub async fn begin_orphan_sweep(&self) {
+        let launcher = self.launcher.clone();
+        *self.sweep.lock().await = Some(tokio::task::spawn_blocking(move || launcher.sweep_orphans()));
+    }
+
+    /// Records core output into the ring buffer as it arrives and forwards it to `CoreEvents`
+    /// in batches (one event per `LOG_BATCH`). Spawn once on the async runtime.
+    pub fn log_task(self: &Arc<Self>) -> impl Future<Output = ()> + Send + 'static {
+        let rx = self.log_rx.lock().unwrap().take();
+        let me = Arc::downgrade(self);
+        async move {
+            let Some(mut rx) = rx else { return };
+            while let Some(line) = rx.recv().await {
+                let Some(me) = me.upgrade() else { return };
+                let mut batch = LogBatch { first: me.record(&line), lines: vec![line] };
+                let deadline = tokio::time::Instant::now() + LOG_BATCH;
+                loop {
+                    tokio::select! {
+                        next = rx.recv() => match next {
+                            Some(line) => {
+                                me.record(&line);
+                                batch.lines.push(line);
+                            }
+                            None => break,
+                        },
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
+                }
+                me.events.logs(&batch);
+            }
         }
     }
 
-    pub async fn status(&self) -> CoreStatus {
-        self.status.lock().await.clone()
+    /// Appends one line to the ring buffer and returns its sequence number.
+    fn record(&self, line: &str) -> u64 {
+        let mut guard = self.logs.lock().unwrap();
+        let (ring, next) = &mut *guard;
+        if ring.len() == LOG_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(line.to_string());
+        *next += 1;
+        *next - 1
     }
 
-    pub fn logs(&self) -> Vec<String> {
-        self.logs.lock().unwrap().iter().cloned().collect()
+    pub async fn status(&self) -> CoreStatus {
+        self.inner.lock().await.status.clone().unwrap_or(CoreStatus::Stopped)
+    }
+
+    pub fn logs(&self) -> LogBatch {
+        let guard = self.logs.lock().unwrap();
+        let (ring, next) = &*guard;
+        LogBatch { first: next - ring.len() as u64, lines: ring.iter().cloned().collect() }
     }
 
     pub async fn clash(&self) -> Option<ClashClient> {
-        self.running.lock().await.as_ref().map(|r| r.clash.clone())
+        self.inner.lock().await.run.as_ref().map(|r| r.clash.clone())
     }
 
-    async fn set_status(&self, s: CoreStatus) {
-        *self.status.lock().await = s.clone();
-        let _ = self.app.emit("core-status", &s);
+    /// Whether the running (or starting) core differs from a profile with `fingerprint` in
+    /// something that only a restart applies, or missed a live change. `None` = the profile
+    /// cannot be turned into a config at all.
+    pub async fn is_stale(&self, fingerprint: Option<&str>) -> bool {
+        let inner = self.inner.lock().await;
+        match &inner.plan {
+            Some(plan) => fingerprint != Some(plan.fingerprint.as_str()) || inner.live_failed,
+            None => false,
+        }
     }
 
-    pub async fn start(&self, profile: &Profile, creds: Option<&Credentials>) -> Result<(), String> {
-        let _guard = self.op.lock().await;
+    fn push_log(&self, line: String) {
+        let _ = self.log_tx.send(line);
+    }
+
+    fn set_status(&self, inner: &mut Inner, s: CoreStatus) {
+        self.events.status(&s);
+        inner.status = Some(s);
+    }
+
+    /// Starts (or restarts) the core with `plan`, then applies `desired`.
+    pub async fn start(self: &Arc<Self>, plan: StartPlan, desired: Selections) -> Result<(), String> {
+        let _op = self.op.lock().await;
+        if let Some(sweep) = self.sweep.lock().await.take() {
+            let _ = sweep.await;
+        }
+        // Validate first: a config sing-box rejects must not cost the user a working connection.
+        if let Err(e) = self.launcher.check(&plan.config).await {
+            let e = format!("設定檢查失敗：{e}");
+            self.fail(e.clone()).await;
+            return Err(e);
+        }
         self.stop_locked().await;
-        self.set_status(CoreStatus::Starting).await;
-        match self.start_locked(profile, creds).await {
+        let plan = Arc::new(plan);
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            inner.generation += 1;
+            inner.plan = Some(plan.clone());
+            inner.desired = desired;
+            inner.crashes = 0;
+            self.set_status(&mut inner, CoreStatus::Starting);
+            inner.generation
+        };
+        match self.launch(&plan, generation).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.stop_locked().await;
-                self.remove_config();
-                self.set_status(CoreStatus::Error { message: e.clone() }).await;
+                let mut inner = self.inner.lock().await;
+                self.set_status(&mut inner, CoreStatus::Error { message: e.clone() });
                 Err(e)
             }
         }
     }
 
-    async fn start_locked(&self, profile: &Profile, creds: Option<&Credentials>) -> Result<(), String> {
-        if !self.paths.sing_box.is_file() {
-            return Err(format!("找不到 sing-box：{}", self.paths.sing_box.display()));
-        }
-
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map_err(|e| format!("無法取得可用連接埠: {e}"))?
-            .port();
-        let listen = format!("127.0.0.1:{port}");
-        let secret = uuid::Uuid::new_v4().simple().to_string();
-
-        // WARP private keys live in the credential store; read them only for this config write.
-        let wireguard_keys: std::collections::BTreeMap<String, String> = profile
-            .nodes
-            .iter()
-            .filter(|n| n.is_wireguard())
-            .filter_map(|n| Some((n.tag.clone(), crate::credentials::load_warp(&n.tag)?.private_key)))
-            .collect();
-        let config = singbox::generate(
-            profile,
-            &GenerateOptions {
-                username: creds.map(|c| c.username.as_str()).unwrap_or_default(),
-                password: creds.map(|c| c.password.as_str()).unwrap_or_default(),
-                wireguard_keys: &wireguard_keys,
-                ruleset_dir: &self.paths.ruleset_dir,
-                clash_listen: &listen,
-                clash_secret: &secret,
-                log_level: "info",
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let config_path = self.paths.core_config_file();
-        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
-            .map_err(|e| format!("寫入設定檔失敗: {e}"))?;
-
-        let check = Command::new(&self.paths.sing_box)
-            .args(["check", "-c"])
-            .arg(&config_path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .await
-            .map_err(|e| format!("無法執行 sing-box: {e}"))?;
-        if !check.status.success() {
-            return Err(format!("設定檢查失敗：{}", strip_ansi(&String::from_utf8_lossy(&check.stderr)).trim()));
-        }
-
-        self.push_log(format!("---- 啟動 sing-box（Clash API {listen}）----"));
-        let mut child = Command::new(&self.paths.sing_box)
-            .args(["run", "-c"])
-            .arg(&config_path)
-            .arg("-D")
-            .arg(&self.paths.run_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("無法啟動 sing-box: {e}"))?;
-
-        #[cfg(windows)]
-        if let Some(handle) = child.raw_handle() {
-            job::assign(handle);
-        }
-        if let Some(out) = child.stdout.take() {
-            self.pump_logs(out);
-        }
-        if let Some(err) = child.stderr.take() {
-            self.pump_logs(err);
-        }
-
-        let (kill_tx, kill_rx) = oneshot::channel::<()>();
-        let (exited_tx, exited_rx) = oneshot::channel::<()>();
-        let (early_tx, mut early_rx) = oneshot::channel::<String>();
-        let app = self.app.clone();
+    /// spawn → health → apply selections → Running. Caller holds `op`; `plan` is checked.
+    async fn launch(self: &Arc<Self>, plan: &StartPlan, generation: u64) -> Result<(), String> {
+        self.push_log("---- 啟動 sing-box ----".into());
+        let child = self.launcher.spawn(&plan.config, self.log_tx.clone()).await?;
+        let (done_tx, done_rx) = oneshot::channel();
+        let me = self.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                status = child.wait() => {
-                    let msg = match status {
-                        Ok(s) => format!("sing-box 意外結束（{s}）"),
-                        Err(e) => format!("sing-box 意外結束: {e}"),
-                    };
-                    // Before the health check completes, report through `early_tx`; afterwards, as a status event.
-                    if let Err(msg) = early_tx.send(msg) {
-                        crate::on_core_crashed(&app, msg).await;
-                    }
-                }
-                _ = kill_rx => {
-                    let _ = child.kill().await;
-                }
-            }
-            let _ = exited_tx.send(());
+            let msg = child.exit.await.unwrap_or_else(|_| "sing-box 已結束".to_string());
+            let _ = done_tx.send(());
+            me.on_exit(generation, msg).await;
         });
+        let mut kill = Some(child.kill);
 
-        let clash = ClashClient::new(&listen, &secret);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(msg) = early_rx.try_recv() {
-                let tail: Vec<String> = self.logs().into_iter().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
-                return Err(format!("{msg}\n{}", tail.join("\n")));
+        let deadline = Instant::now() + self.health_timeout;
+        let failure = loop {
+            if let Some((_, msg)) = self.inner.lock().await.early_exit.take_if(|(g, _)| *g == generation) {
+                // The last lines (often the FATAL reason) may still be in the pipe.
+                tokio::time::sleep(LOG_BATCH).await;
+                let lines = self.logs().lines;
+                let tail = &lines[lines.len().saturating_sub(8)..];
+                break Some(format!("{msg}\n{}", tail.join("\n")));
             }
-            if clash.version().await.is_ok() {
-                break;
+            if self.launcher.healthy(&plan.clash).await {
+                break None;
             }
-            if tokio::time::Instant::now() > deadline {
-                let _ = kill_tx.send(());
-                return Err("sing-box 啟動逾時（10 秒內 Clash API 沒有回應）".into());
+            if Instant::now() > deadline {
+                break Some("sing-box 啟動逾時（10 秒內 Clash API 沒有回應）".to_string());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        if let Some(e) = failure {
+            if let Some(k) = kill.take() {
+                let _ = k.send(());
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
+            // The TUN may have been up for a moment.
+            self.launcher.cleanup().await;
+            return Err(e);
         }
-        // From here on, an exit is a crash reported via `on_core_crashed`.
-        drop(early_rx);
 
-        // With cache_file enabled, sing-box restores each selector's last live choice and
-        // ignores `default`, so choices made while disconnected would be lost. The profile
-        // is the source of truth: re-apply it. (cache_file stays for the FakeIP store.)
-        let _ = clash.select(proxy_core::TAG_PROXY, profile.effective_selected()).await;
-        for g in profile.groups.iter().filter(|g| g.enabled && g.target == proxy_core::Target::Proxy) {
-            let _ = clash.select(&g.selector_tag(), profile.effective_group_outbound(g)).await;
+        let _live = self.live.lock().await;
+        let desired = {
+            let mut inner = self.inner.lock().await;
+            // The process may have died between the last health probe and here.
+            if let Some((_, msg)) = inner.early_exit.take_if(|(g, _)| *g == generation) {
+                return Err(msg);
+            }
+            inner.run = Some(Run { clash: plan.clash.clone(), kill: kill.take(), done: done_rx, started: Instant::now() });
+            inner.desired.clone()
+        };
+        // The fresh cache_id already starts every selector from the profile; applying the
+        // full set again covers auto-restarts and changes made while starting.
+        let ops = applicable(plan, diff(None, &desired));
+        let applied = self.launcher.apply(&plan.clash, &ops).await;
+        let mut inner = self.inner.lock().await;
+        if inner.generation != generation || inner.run.is_none() {
+            // Stopped meanwhile, or the process died while we applied (`on_exit` took the run
+            // and owns the crash handling — do not paint over its status).
+            return Ok(());
         }
-
-        *self.running.lock().await = Some(Running { clash, kill: kill_tx, exited: exited_rx });
+        match applied {
+            Ok(()) => {
+                inner.live = Some(applied_part(plan, &desired));
+                inner.live_failed = false;
+            }
+            Err(e) => {
+                self.push_log(format!("---- 套用節點選擇失敗：{e} ----"));
+                inner.live_failed = true;
+            }
+        }
         let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        self.set_status(CoreStatus::Running { started_at }).await;
+        self.set_status(&mut inner, CoreStatus::Running { started_at });
         Ok(())
     }
 
-    pub async fn stop(&self) {
-        let _guard = self.op.lock().await;
-        self.stop_locked().await;
-        self.set_status(CoreStatus::Stopped).await;
-    }
-
-    async fn stop_locked(&self) {
-        let Some(r) = self.running.lock().await.take() else { return };
-        let _ = r.kill.send(());
-        let _ = tokio::time::timeout(Duration::from_secs(5), r.exited).await;
-        self.remove_config();
-        self.push_log("---- sing-box 已停止 ----".into());
-        // FakeIP answers cached by Windows would point at the now-closed TUN.
-        let _ = Command::new("ipconfig").arg("/flushdns").creation_flags(CREATE_NO_WINDOW).output().await;
-    }
-
-    /// Called by the supervisor after an unexpected exit post-startup.
-    pub async fn mark_crashed(&self, message: String) {
-        self.running.lock().await.take();
-        self.remove_config();
-        self.push_log(format!("---- {message} ----"));
-        self.set_status(CoreStatus::Error { message }).await;
-    }
-
-    /// sing-box reads its config only at startup; deleting it afterwards keeps the
-    /// Mudfish credentials off disk while disconnected.
-    fn remove_config(&self) {
-        let _ = std::fs::remove_file(self.paths.core_config_file());
-    }
-
-    fn push_log(&self, line: String) {
-        push_line(&self.logs, &self.app, line);
-    }
-
-    fn pump_logs<R: AsyncRead + Unpin + Send + 'static>(&self, reader: R) {
-        let logs = self.logs.clone();
-        let app = self.app.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                push_line(&logs, &app, strip_ansi(&line));
+    /// Records the profile's live choices and applies the changes to a running core.
+    pub async fn set_selections(&self, desired: Selections) -> Result<(), String> {
+        let _live = self.live.lock().await;
+        let (clash, ops) = {
+            let mut inner = self.inner.lock().await;
+            inner.desired = desired.clone();
+            match (&inner.run, &inner.status, &inner.plan) {
+                (Some(run), Some(CoreStatus::Running { .. }), Some(plan)) => {
+                    (run.clash.clone(), applicable(plan, diff(inner.live.as_ref(), &desired)))
+                }
+                _ => return Ok(()), // applied after the next (re)start
             }
-        });
+        };
+        let result = if ops.is_empty() { Ok(()) } else { self.launcher.apply(&clash, &ops).await };
+        let mut inner = self.inner.lock().await;
+        match &result {
+            Ok(()) => {
+                inner.live = inner.plan.as_ref().map(|plan| applied_part(plan, &desired));
+                inner.live_failed = false;
+            }
+            Err(e) => {
+                inner.live = None; // unknown now: the next change resends everything
+                inner.live_failed = true;
+                self.push_log(format!("---- 套用節點選擇失敗：{e} ----"));
+            }
+        }
+        result
+    }
+
+    /// Reports a start that failed before reaching the core (no credentials, invalid
+    /// profile, rejected config). A running core keeps running; only an idle one shows it.
+    pub async fn fail(&self, message: String) {
+        let mut inner = self.inner.lock().await;
+        if matches!(inner.status, None | Some(CoreStatus::Stopped | CoreStatus::Error { .. })) {
+            self.set_status(&mut inner, CoreStatus::Error { message });
+        }
+    }
+
+    pub async fn stop(&self) {
+        let _op = self.op.lock().await;
+        self.stop_locked().await;
+        let mut inner = self.inner.lock().await;
+        self.set_status(&mut inner, CoreStatus::Stopped);
+    }
+
+    /// Kills the current run (if any) and forgets the session. Caller holds `op`.
+    async fn stop_locked(&self) {
+        let run = {
+            let mut inner = self.inner.lock().await;
+            inner.generation += 1; // the exit that follows is intentional
+            inner.plan = None;
+            inner.live = None;
+            inner.live_failed = false;
+            inner.early_exit = None;
+            inner.run.take()
+        };
+        let Some(mut run) = run else { return };
+        if let Some(k) = run.kill.take() {
+            let _ = k.send(());
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), run.done).await;
+        self.push_log("---- sing-box 已停止 ----".into());
+        self.launcher.cleanup().await;
+    }
+
+    /// Called by the per-run monitor when the process exits.
+    async fn on_exit(self: Arc<Self>, generation: u64, message: String) {
+        let mut inner = self.inner.lock().await;
+        if inner.generation != generation {
+            return; // stopped or replaced on purpose
+        }
+        let Some(run) = inner.run.take() else {
+            // Still starting: `launch` picks this up.
+            inner.early_exit = Some((generation, message));
+            return;
+        };
+        inner.live = None;
+        if run.started.elapsed() >= self.stable_after {
+            inner.crashes = 0;
+        }
+        self.after_crash(inner, generation, message).await;
+    }
+
+    /// Schedules the next automatic restart, or gives up once the budget is spent.
+    async fn after_crash(self: &Arc<Self>, mut inner: tokio::sync::MutexGuard<'_, Inner>, generation: u64, message: String) {
+        let attempt = inner.crashes;
+        self.push_log(format!("---- {message} ----"));
+        match self.restart_delays.get(attempt as usize).copied() {
+            Some(delay) => {
+                inner.crashes += 1;
+                self.set_status(&mut inner, CoreStatus::Reconnecting { attempt: attempt + 1, message });
+                drop(inner);
+                self.launcher.cleanup().await;
+                let me = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    me.restart(generation).await;
+                });
+            }
+            None => {
+                inner.plan = None;
+                self.set_status(&mut inner, CoreStatus::Error { message: format!("{message}（已自動重試 {attempt} 次）") });
+                drop(inner);
+                self.launcher.cleanup().await;
+            }
+        }
+    }
+
+    /// Boxed: restart → after_crash → (spawned) restart would otherwise be a recursive type.
+    fn restart(self: Arc<Self>, crashed_generation: u64) -> BoxFut<'static, ()> {
+        Box::pin(async move { self.restart_inner(crashed_generation).await })
+    }
+
+    async fn restart_inner(self: &Arc<Self>, crashed_generation: u64) {
+        let _op = self.op.lock().await;
+        let (plan, generation) = {
+            let mut inner = self.inner.lock().await;
+            if inner.generation != crashed_generation || !matches!(inner.status, Some(CoreStatus::Reconnecting { .. })) {
+                return; // the user stopped or restarted meanwhile
+            }
+            let Some(plan) = inner.plan.clone() else { return };
+            inner.generation += 1;
+            (plan, inner.generation)
+        };
+        if let Err(e) = self.launch(&plan, generation).await {
+            // A failed restart counts like another crash of the same session.
+            let inner = self.inner.lock().await;
+            if inner.generation == generation {
+                self.after_crash(inner, generation, format!("自動重啟失敗：{e}")).await;
+            }
+        }
     }
 }
 
-fn push_line(logs: &std::sync::Mutex<VecDeque<String>>, app: &AppHandle, line: String) {
-    {
-        let mut l = logs.lock().unwrap();
-        if l.len() == LOG_CAPACITY {
-            l.pop_front();
-        }
-        l.push_back(line.clone());
+/// Drops switches the running config cannot take (selector or member added since it started);
+/// the fingerprint already marks those as needing a reconnect.
+fn applicable(plan: &StartPlan, ops: Vec<LiveOp>) -> Vec<LiveOp> {
+    ops.into_iter()
+        .filter(|op| match op {
+            LiveOp::Select { selector, outbound } => plan.selectors.get(selector).is_some_and(|m| m.contains(outbound)),
+            LiveOp::Mode(_) | LiveOp::CloseAll => true,
+        })
+        .collect()
+}
+
+/// The part of `desired` the running config can hold; skipped choices are left out (unknown),
+/// so `live` only ever records what was really sent.
+fn applied_part(plan: &StartPlan, desired: &Selections) -> Selections {
+    let fits = |selector: &str, outbound: &str| plan.selectors.get(selector).is_some_and(|m| m.contains(outbound));
+    Selections {
+        mode: desired.mode,
+        default_node: if fits(TAG_PROXY, &desired.default_node) { desired.default_node.clone() } else { String::new() },
+        groups: desired.groups.iter().filter(|(s, o)| fits(s, o)).map(|(s, o)| (s.clone(), o.clone())).collect(),
     }
-    let _ = app.emit("core-log", line);
+}
+
+/// Clash API calls that turn `from` (unknown → everything) into `to`.
+fn diff(from: Option<&Selections>, to: &Selections) -> Vec<LiveOp> {
+    let mut ops = Vec::new();
+    if from.map(|f| &f.default_node) != Some(&to.default_node) {
+        ops.push(LiveOp::Select { selector: TAG_PROXY.to_string(), outbound: to.default_node.clone() });
+    }
+    for (selector, outbound) in &to.groups {
+        if from.and_then(|f| f.groups.get(selector)) != Some(outbound) {
+            ops.push(LiveOp::Select { selector: selector.clone(), outbound: outbound.clone() });
+        }
+    }
+    if from.map(|f| f.mode) != Some(to.mode) {
+        ops.push(LiveOp::Mode(to.mode));
+        if from.is_some() {
+            ops.push(LiveOp::CloseAll);
+        }
+    }
+    ops
+}
+
+/// The real sing-box sidecar.
+pub struct SingBox {
+    pub exe: std::path::PathBuf,
+    /// sing-box working directory (`cache.db`); writable by administrators only.
+    pub run_dir: std::path::PathBuf,
+}
+
+/// Cache files only grow (one bucket per start id); start over past this size.
+const CACHE_LIMIT: u64 = 16 * 1024 * 1024;
+
+#[cfg(windows)]
+mod spawn {
+    use std::process::Stdio;
+
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+    use tokio::sync::mpsc;
+
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    pub fn command(exe: &std::path::Path) -> Command {
+        let mut c = Command::new(exe);
+        c.creation_flags(CREATE_NO_WINDOW);
+        c
+    }
+
+    /// Feeds the config over stdin and closes it, so sing-box reads it once (`-c stdin`).
+    pub async fn feed(child: &mut tokio::process::Child, config: &[u8]) -> Result<(), String> {
+        let mut stdin = child.stdin.take().ok_or("sing-box stdin 無法使用")?;
+        stdin.write_all(config).await.map_err(|e| format!("無法傳送設定給 sing-box: {e}"))?;
+        drop(stdin);
+        Ok(())
+    }
+
+    pub fn pump<R: AsyncRead + Unpin + Send + 'static>(reader: R, log: mpsc::UnboundedSender<String>) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = log.send(super::strip_ansi(&line));
+            }
+        });
+    }
+
+    pub fn piped(c: &mut Command) -> &mut Command {
+        c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+    }
+}
+
+#[cfg(windows)]
+impl Launcher for SingBox {
+    fn check<'a>(&'a self, config: &'a [u8]) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move {
+            let mut cmd = spawn::command(&self.exe);
+            cmd.args(["check", "-c", "stdin"]);
+            let mut child = spawn::piped(&mut cmd).spawn().map_err(|e| format!("無法執行 sing-box: {e}"))?;
+            spawn::feed(&mut child, config).await?;
+            let out = child.wait_with_output().await.map_err(|e| format!("無法執行 sing-box: {e}"))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(strip_ansi(String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        })
+    }
+
+    fn spawn<'a>(&'a self, config: &'a [u8], log: mpsc::UnboundedSender<String>) -> BoxFut<'a, Result<Child, String>> {
+        Box::pin(async move {
+            if !self.exe.is_file() {
+                return Err(format!("找不到 sing-box：{}", self.exe.display()));
+            }
+            let cache = self.run_dir.join("cache.db");
+            if std::fs::metadata(&cache).is_ok_and(|m| m.len() > CACHE_LIMIT) {
+                let _ = std::fs::remove_file(&cache);
+            }
+            let mut cmd = spawn::command(&self.exe);
+            cmd.args(["run", "-c", "stdin", "-D"]).arg(&self.run_dir).kill_on_drop(true);
+            let mut child = spawn::piped(&mut cmd).spawn().map_err(|e| format!("無法啟動 sing-box: {e}"))?;
+            if let Some(handle) = child.raw_handle() {
+                job::assign(handle);
+            }
+            if let Some(out) = child.stdout.take() {
+                spawn::pump(out, log.clone());
+            }
+            if let Some(err) = child.stderr.take() {
+                spawn::pump(err, log);
+            }
+            spawn::feed(&mut child, config).await?;
+
+            let (kill_tx, kill_rx) = oneshot::channel::<()>();
+            let (exit_tx, exit_rx) = oneshot::channel::<String>();
+            tokio::spawn(async move {
+                let msg = tokio::select! {
+                    status = child.wait() => match status {
+                        Ok(s) => format!("sing-box 意外結束（{s}）"),
+                        Err(e) => format!("sing-box 意外結束: {e}"),
+                    },
+                    _ = kill_rx => {
+                        let _ = child.kill().await;
+                        "sing-box 已停止".to_string()
+                    }
+                };
+                let _ = exit_tx.send(msg);
+            });
+            Ok(Child { kill: kill_tx, exit: exit_rx })
+        })
+    }
+
+    fn healthy<'a>(&'a self, clash: &'a ClashClient) -> BoxFut<'a, bool> {
+        Box::pin(async move { clash.version().await.is_ok() })
+    }
+
+    fn apply<'a>(&'a self, clash: &'a ClashClient, ops: &'a [LiveOp]) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move {
+            for op in ops {
+                match op {
+                    LiveOp::Select { selector, outbound } => clash.select(selector, outbound).await?,
+                    LiveOp::Mode(m) => clash.set_mode(m.as_clash()).await?,
+                    LiveOp::CloseAll => clash.close_all().await?,
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn cleanup(&self) -> BoxFut<'_, ()> {
+        Box::pin(async move {
+            // FakeIP answers cached by Windows would point at the now-closed TUN.
+            let _ = spawn::command(std::path::Path::new("ipconfig")).arg("/flushdns").output().await;
+        })
+    }
+
+    fn sweep_orphans(&self) {
+        kill_orphans(&self.exe);
+    }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -347,28 +786,328 @@ pub fn kill_orphans(sing_box: &std::path::Path) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(UpdateKind::Always));
+    let target = sing_box.to_string_lossy();
     for p in sys.processes().values() {
-        if p.exe().is_some_and(|e| e.eq_ignore_ascii_case(sing_box)) {
+        if p.exe().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(&target)) {
             log::warn!("結束殘留的 sing-box（pid {}）", p.pid());
             p.kill();
         }
     }
 }
 
-trait PathEqIgnoreCase {
-    fn eq_ignore_ascii_case(&self, other: &std::path::Path) -> bool;
-}
-
-impl PathEqIgnoreCase for std::path::Path {
-    fn eq_ignore_ascii_case(&self, other: &std::path::Path) -> bool {
-        self.as_os_str().to_string_lossy().eq_ignore_ascii_case(&other.as_os_str().to_string_lossy())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     #[test]
     fn strips_ansi_colors() {
-        assert_eq!(super::strip_ansi("+0000 \u{1b}[36mINFO\u{1b}[0m started"), "+0000 INFO started");
+        assert_eq!(strip_ansi("+0000 \u{1b}[36mINFO\u{1b}[0m started"), "+0000 INFO started");
+    }
+
+    /// Scripted launcher: each spawn takes the next behaviour; exits are triggered by tests.
+    #[derive(Default)]
+    struct Fake {
+        check_error: std::sync::Mutex<Option<String>>,
+        /// Per spawn: `true` = becomes healthy.
+        healthy: std::sync::Mutex<VecDeque<bool>>,
+        spawns: AtomicU32,
+        cleanups: AtomicU32,
+        exits: std::sync::Mutex<Vec<oneshot::Sender<String>>>,
+        current_healthy: std::sync::atomic::AtomicBool,
+        applied: std::sync::Mutex<Vec<LiveOp>>,
+        /// The next apply kills the process mid-way (it died while selections were sent).
+        crash_in_apply: std::sync::atomic::AtomicBool,
+    }
+
+    impl Fake {
+        /// Simulates the latest process dying on its own.
+        fn crash(&self) {
+            if let Some(tx) = self.exits.lock().unwrap().pop() {
+                let _ = tx.send("boom".into());
+            }
+        }
+    }
+
+    impl Launcher for Fake {
+        fn check<'a>(&'a self, _: &'a [u8]) -> BoxFut<'a, Result<(), String>> {
+            let e = self.check_error.lock().unwrap().clone();
+            Box::pin(async move { e.map_or(Ok(()), Err) })
+        }
+        fn spawn<'a>(&'a self, _: &'a [u8], _: mpsc::UnboundedSender<String>) -> BoxFut<'a, Result<Child, String>> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            let healthy = self.healthy.lock().unwrap().pop_front().unwrap_or(true);
+            self.current_healthy.store(healthy, Ordering::SeqCst);
+            let (kill_tx, kill_rx) = oneshot::channel::<()>();
+            let (exit_tx, exit_rx) = oneshot::channel::<String>();
+            let (crash_tx, crash_rx) = oneshot::channel::<String>();
+            self.exits.lock().unwrap().push(crash_tx);
+            tokio::spawn(async move {
+                let msg = tokio::select! {
+                    m = crash_rx => m.unwrap_or_else(|_| "gone".into()),
+                    _ = kill_rx => "killed".into(),
+                };
+                let _ = exit_tx.send(msg);
+            });
+            Box::pin(async move { Ok(Child { kill: kill_tx, exit: exit_rx }) })
+        }
+        fn healthy<'a>(&'a self, _: &'a ClashClient) -> BoxFut<'a, bool> {
+            let h = self.current_healthy.load(Ordering::SeqCst);
+            Box::pin(async move { h })
+        }
+        fn apply<'a>(&'a self, _: &'a ClashClient, ops: &'a [LiveOp]) -> BoxFut<'a, Result<(), String>> {
+            self.applied.lock().unwrap().extend(ops.iter().cloned());
+            let crash = self.crash_in_apply.swap(false, Ordering::SeqCst);
+            if crash {
+                self.crash();
+            }
+            Box::pin(async move {
+                if crash {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    return Err("connection refused".into());
+                }
+                Ok(())
+            })
+        }
+        fn cleanup(&self) -> BoxFut<'_, ()> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn sweep_orphans(&self) {}
+    }
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<CoreStatus>>);
+    impl CoreEvents for Recorder {
+        fn status(&self, s: &CoreStatus) {
+            self.0.lock().unwrap().push(s.clone());
+        }
+        fn logs(&self, _: &LogBatch) {}
+    }
+
+    fn plan(fp: &str) -> StartPlan {
+        let members = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        StartPlan {
+            config: b"{}".to_vec(),
+            clash: ClashClient::new("127.0.0.1:9", "s"),
+            fingerprint: fp.into(),
+            selectors: BTreeMap::from([
+                ("proxy".to_string(), members(&["auto", "direct", "mudfish-1", "mudfish-2"])),
+                ("group-a".to_string(), members(&["proxy", "auto", "mudfish-1", "mudfish-2"])),
+            ]),
+        }
+    }
+
+    fn sel(node: &str) -> Selections {
+        Selections { mode: Mode::Rule, default_node: node.into(), groups: BTreeMap::from([("group-a".into(), "proxy".into())]) }
+    }
+
+    fn setup() -> (Arc<CoreManager>, Arc<Fake>, Arc<Recorder>) {
+        let fake = Arc::new(Fake::default());
+        let rec = Arc::new(Recorder::default());
+        let mut m = CoreManager::with_policy(fake.clone(), rec.clone(), vec![Duration::from_millis(10); 2], Duration::from_secs(60));
+        Arc::get_mut(&mut m).unwrap().health_timeout = Duration::from_millis(300);
+        (m, fake, rec)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    #[tokio::test]
+    async fn start_applies_selections_and_tracks_staleness() {
+        let (m, fake, _) = setup();
+        m.start(plan("fp1"), sel("auto")).await.unwrap();
+        assert!(matches!(m.status().await, CoreStatus::Running { .. }));
+        let applied = fake.applied.lock().unwrap().clone();
+        assert_eq!(applied[0], LiveOp::Select { selector: "proxy".into(), outbound: "auto".into() });
+        assert!(applied.contains(&LiveOp::Mode(Mode::Rule)));
+        assert!(!applied.contains(&LiveOp::CloseAll), "no connections to close on a fresh start");
+        assert!(!m.is_stale(Some("fp1")).await);
+        assert!(m.is_stale(Some("fp2")).await);
+        assert!(m.is_stale(None).await, "an invalid profile is never what is running");
+
+        // live change: only the difference, no CloseAll for selectors
+        fake.applied.lock().unwrap().clear();
+        m.set_selections(sel("direct")).await.unwrap();
+        assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "proxy".into(), outbound: "direct".into() }]);
+        let mut global = sel("direct");
+        global.mode = Mode::Global;
+        fake.applied.lock().unwrap().clear();
+        m.set_selections(global).await.unwrap();
+        assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Mode(Mode::Global), LiveOp::CloseAll]);
+
+        m.stop().await;
+        assert_eq!(m.status().await, CoreStatus::Stopped);
+        assert!(!m.is_stale(Some("fp2")).await, "nothing is stale while stopped");
+        assert_eq!(fake.cleanups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn selections_while_stopped_apply_on_next_start() {
+        let (m, fake, _) = setup();
+        m.set_selections(sel("mudfish-1")).await.unwrap();
+        assert!(fake.applied.lock().unwrap().is_empty());
+        m.start(plan("fp"), sel("mudfish-2")).await.unwrap();
+        assert!(fake.applied.lock().unwrap().contains(&LiveOp::Select { selector: "proxy".into(), outbound: "mudfish-2".into() }));
+    }
+
+    #[tokio::test]
+    async fn crash_while_applying_selections_still_restarts() {
+        let (m, fake, rec) = setup();
+        fake.crash_in_apply.store(true, Ordering::SeqCst);
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        settle().await;
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 2, "the crash during apply was not swallowed");
+        assert!(matches!(m.status().await, CoreStatus::Running { .. }));
+        assert!(m.clash().await.is_some(), "Running really has a process behind it");
+        assert!(rec.0.lock().unwrap().iter().any(|s| matches!(s, CoreStatus::Reconnecting { .. })));
+    }
+
+    #[tokio::test]
+    async fn switches_the_running_config_lacks_wait_for_restart() {
+        let (m, fake, _) = setup();
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        fake.applied.lock().unwrap().clear();
+        let mut s = sel("mudfish-3"); // node added after the start
+        s.groups.insert("group-new".into(), "proxy".into()); // group added after the start
+        s.groups.insert("group-a".into(), "auto".into());
+        m.set_selections(s).await.unwrap();
+        assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "group-a".into(), outbound: "auto".into() }]);
+        assert!(!m.is_stale(Some("fp")).await, "skipped switches are not failures");
+    }
+
+    #[tokio::test]
+    async fn rejected_config_or_invalid_profile_keeps_the_running_core() {
+        let (m, fake, _) = setup();
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        *fake.check_error.lock().unwrap() = Some("bad rule".into());
+        assert!(m.start(plan("fp2"), sel("auto")).await.unwrap_err().contains("bad rule"));
+        m.fail("群組沒有條件".into()).await;
+        assert!(matches!(m.status().await, CoreStatus::Running { .. }));
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.exits.lock().unwrap().iter().filter(|t| !t.is_closed()).count(), 1, "still alive");
+        m.stop().await;
+        m.fail("群組沒有條件".into()).await;
+        assert!(matches!(m.status().await, CoreStatus::Error { .. }), "an idle core shows the failure");
+    }
+
+    #[tokio::test]
+    async fn log_snapshot_and_batches_share_sequence_numbers() {
+        let (m, _, _) = setup();
+        tokio::spawn(m.log_task());
+        for i in 0..3 {
+            m.push_log(format!("line {i}"));
+        }
+        tokio::time::sleep(LOG_BATCH * 2).await;
+        let snap = m.logs();
+        assert_eq!(snap.first, 0);
+        assert_eq!(snap.lines, ["line 0", "line 1", "line 2"]);
+    }
+
+    #[tokio::test]
+    async fn check_failure_and_health_timeout_report_errors() {
+        let (m, fake, _) = setup();
+        *fake.check_error.lock().unwrap() = Some("bad rule".into());
+        let e = m.start(plan("fp"), sel("auto")).await.unwrap_err();
+        assert!(e.contains("bad rule"));
+        assert!(matches!(m.status().await, CoreStatus::Error { .. }));
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 0);
+
+        *fake.check_error.lock().unwrap() = None;
+        fake.healthy.lock().unwrap().push_back(false);
+        let e = m.start(plan("fp"), sel("auto")).await.unwrap_err();
+        assert!(e.contains("逾時"));
+        assert_eq!(fake.exits.lock().unwrap().iter().filter(|t| !t.is_closed()).count(), 0, "unhealthy core was killed");
+    }
+
+    #[tokio::test]
+    async fn exit_before_health_fails_start() {
+        let (m, fake, _) = setup();
+        fake.healthy.lock().unwrap().push_back(false);
+        let start = tokio::spawn({
+            let m = m.clone();
+            async move { m.start(plan("fp"), sel("auto")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.crash();
+        let e = start.await.unwrap().unwrap_err();
+        assert!(e.contains("boom"));
+        assert!(matches!(m.status().await, CoreStatus::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn crash_restarts_with_budget_then_errors() {
+        let (m, fake, rec) = setup();
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        fake.crash();
+        settle().await;
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 2, "first crash restarts");
+        assert!(matches!(m.status().await, CoreStatus::Running { .. }));
+        assert!(rec.0.lock().unwrap().iter().any(|s| matches!(s, CoreStatus::Reconnecting { attempt: 1, .. })));
+        assert!(fake.cleanups.load(Ordering::SeqCst) >= 1, "DNS cleanup also runs after a crash");
+
+        fake.crash();
+        settle().await;
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 3);
+        fake.crash();
+        settle().await;
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 3, "budget of 2 restarts used up");
+        let CoreStatus::Error { message } = m.status().await else { panic!("expected error") };
+        assert!(message.contains("2 次"));
+        assert!(!m.is_stale(Some("other")).await, "a dead session is not stale");
+    }
+
+    #[tokio::test]
+    async fn stop_during_restart_backoff_wins() {
+        let fake = Arc::new(Fake::default());
+        let rec = Arc::new(Recorder::default());
+        let m = CoreManager::with_policy(fake.clone(), rec.clone(), vec![Duration::from_millis(200)], Duration::from_secs(60));
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        fake.crash();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(m.status().await, CoreStatus::Reconnecting { .. }));
+        m.stop().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(m.status().await, CoreStatus::Stopped);
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 1, "no restart after the user stopped");
+    }
+
+    #[tokio::test]
+    async fn intentional_stop_never_reports_error() {
+        let (m, _fake, rec) = setup();
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        m.stop().await;
+        settle().await;
+        let seen = rec.0.lock().unwrap().clone();
+        assert!(!seen.iter().any(|s| matches!(s, CoreStatus::Error { .. } | CoreStatus::Reconnecting { .. })), "{seen:?}");
+        assert_eq!(seen.last(), Some(&CoreStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_leave_one_core() {
+        let (m, fake, _) = setup();
+        let a = tokio::spawn({
+            let m = m.clone();
+            async move { m.start(plan("a"), sel("auto")).await }
+        });
+        let b = tokio::spawn({
+            let m = m.clone();
+            async move { m.start(plan("b"), sel("auto")).await }
+        });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        settle().await;
+        assert_eq!(fake.spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.exits.lock().unwrap().iter().filter(|t| !t.is_closed()).count(), 1, "the first core was killed");
+        assert!(matches!(m.status().await, CoreStatus::Running { .. }));
+    }
+
+    #[test]
+    fn diff_from_unknown_sets_everything() {
+        let ops = diff(None, &sel("auto"));
+        assert_eq!(ops.len(), 3);
+        assert!(diff(Some(&sel("auto")), &sel("auto")).is_empty());
     }
 }

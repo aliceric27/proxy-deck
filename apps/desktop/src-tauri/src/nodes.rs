@@ -3,8 +3,9 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proxy_core::mudfish::{self, MudfishNode};
-use proxy_core::MUDFISH_SOCKS_PORT;
+use proxy_core::{ProxyNode, MUDFISH_SOCKS_PORT};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::paths::Paths;
 
@@ -15,6 +16,31 @@ const CACHE_TTL_SECS: u64 = 6 * 3600;
 pub struct NodeCache {
     pub fetched_at: u64,
     pub nodes: Vec<MudfishNode>,
+}
+
+/// The node list as the UI gets it: each entry carries the `ProxyNode` to add, so the
+/// Mudfish → node conversion exists only in proxy-core.
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
+pub struct NodeList {
+    #[ts(type = "number")]
+    pub fetched_at: u64,
+    pub nodes: Vec<NodeEntry>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
+pub struct NodeEntry {
+    #[serde(flatten)]
+    pub node: MudfishNode,
+    pub proxy: ProxyNode,
+}
+
+impl From<NodeCache> for NodeList {
+    fn from(c: NodeCache) -> Self {
+        let nodes = c.nodes.into_iter().map(|node| NodeEntry { proxy: node.to_proxy_node(), node }).collect();
+        Self { fetched_at: c.fetched_at, nodes }
+    }
 }
 
 fn now() -> u64 {
@@ -55,7 +81,8 @@ async fn fetch(http: &reqwest::Client) -> Result<Vec<MudfishNode>, String> {
     mudfish::parse_static_nodes(&body).map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
 pub struct PingResult {
     pub ip: String,
     /// TCP handshake time to the SOCKS port; `None` when unreachable within the timeout.

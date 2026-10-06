@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ProcessInfo {
     pub name: String,
     pub path: String,
@@ -59,7 +60,8 @@ pub fn is_elevated() -> bool {
     false
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct RuleSetCatalog {
     pub geosite: Vec<String>,
     pub geoip: Vec<String>,

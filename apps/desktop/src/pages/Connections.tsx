@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Activity, Pause, Play, Search, XCircle } from "lucide-react";
 import { api, errorText, groupSelectorTag, type Connection, type RuleGroup, type Target } from "../lib/ipc";
-import { useApp, useInterval } from "../lib/store";
+import { useApp, useInterval, useTraffic } from "../lib/store";
 import { basename, formatBytes, formatElapsed } from "../lib/format";
 import { Badge, Button, ContextMenu, cx, EmptyState, Input, PageHeader, Segmented, type MenuItem } from "../components/ui";
 import { newGroup } from "../components/groups";
@@ -15,27 +15,15 @@ const isProxied = (c: Connection) => c.chains.length > 0 && c.chains[0] !== "dir
 export default function Connections() {
   const { profile, core, updateProfile, toast } = useApp();
   const running = core.state === "running";
-  const [conns, setConns] = useState<Connection[]>([]);
   const [paused, setPaused] = useState(false);
+  const conns = useTraffic(paused)?.connections ?? [];
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<SortKey>("start");
   const [menu, setMenu] = useState<{ x: number; y: number; c: Connection } | null>(null);
   const [now, setNow] = useState(Date.now());
 
-  useInterval(
-    async () => {
-      try {
-        const s = await api.connections();
-        setConns(s.connections ?? []);
-        setNow(Date.now());
-      } catch {
-        /* core stopping */
-      }
-    },
-    1000,
-    running && !paused,
-  );
+  useInterval(() => setNow(Date.now()), 1000, running && !paused);
 
   const visible = useMemo(() => {
     const ql = q.trim().toLowerCase();
@@ -57,7 +45,7 @@ export default function Connections() {
   const createGroup = (kind: "app" | "domain", target: Target, value: string) => {
     const g = newGroup(kind === "app" ? { name: value, target, process_names: [value] } : { name: value, target, domain_suffixes: [value] });
     updateProfile((p) => ({ ...p, groups: [g, ...p.groups] }));
-    toast(`已新增最優先的群組「${g.name}」，重新連線後生效。`, "success");
+    toast(`已新增最優先的群組「${g.name}」${running ? "，重新連線後生效" : ""}。`, "success");
   };
 
   const addToGroup = (g: RuleGroup, kind: "app" | "domain", value: string) => {
@@ -71,7 +59,7 @@ export default function Connections() {
             : { ...x, domain_suffixes: [...new Set([...x.domain_suffixes, value])] },
       ),
     }));
-    toast(`已把 ${value} 加入群組「${g.name}」，重新連線後生效。`, "success");
+    toast(`已把 ${value} 加入群組「${g.name}」${running ? "，重新連線後生效" : ""}。`, "success");
   };
 
   const menuItems = (c: Connection): MenuItem[] => {

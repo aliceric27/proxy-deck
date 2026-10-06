@@ -1,8 +1,8 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { ArrowDown, ArrowUp, ListFilter } from "lucide-react";
 import type { PageId } from "../App";
-import { api, errorText, groupSelectorTag, type ClashProxy, type Connection, type Mode, type RuleGroup } from "../lib/ipc";
-import { useApp, useInterval } from "../lib/store";
+import { api, groupSelectorTag, type ClashProxy, type Mode, type RuleGroup } from "../lib/ipc";
+import { useApp, useInterval, useTraffic } from "../lib/store";
 import { formatBytes, formatElapsed, formatRate } from "../lib/format";
 import { Badge, Button, Card, cx, PageHeader, Segmented } from "../components/ui";
 import { DefaultNodeSelect, MatcherSummary, nodeDisplayName, OutboundSelect, resolveNode, TargetBadge } from "../components/groups";
@@ -14,39 +14,15 @@ const MODES: { value: Mode; label: string; hint: string }[] = [
 ];
 
 export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => void }) {
-  const { profile, core, patchLocal, toast } = useApp();
+  const { profile, core, updateProfile } = useApp();
   const running = core.state === "running";
-  const [rates, setRates] = useState({ up: 0, down: 0, upTotal: 0, downTotal: 0 });
-  const [conns, setConns] = useState<Connection[]>([]);
+  const traffic = useTraffic();
+  const conns = traffic?.connections ?? [];
   const [proxies, setProxies] = useState<Record<string, ClashProxy>>({});
-  const last = useRef<{ t: number; up: number; down: number } | null>(null);
-
-  useInterval(
-    async () => {
-      try {
-        const c = await api.connections();
-        const now = Date.now();
-        const prev = last.current;
-        const dt = prev ? (now - prev.t) / 1000 : 0;
-        setRates({
-          up: prev && dt > 0 ? (c.uploadTotal - prev.up) / dt : 0,
-          down: prev && dt > 0 ? (c.downloadTotal - prev.down) / dt : 0,
-          upTotal: c.uploadTotal,
-          downTotal: c.downloadTotal,
-        });
-        setConns(c.connections ?? []);
-        last.current = { t: now, up: c.uploadTotal, down: c.downloadTotal };
-      } catch {
-        /* core stopping */
-      }
-    },
-    1000,
-    running,
-  );
 
   const refreshProxies = async () => {
     try {
-      setProxies((await api.proxies()).proxies);
+      setProxies(await api.proxies());
     } catch {
       /* core stopping */
     }
@@ -59,24 +35,12 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
   const defaultNow = running ? nodeName(resolveNode(proxies, "proxy")) : undefined;
   const activeGroups = profile.groups.filter((g) => g.enabled);
 
-  const selectGroup = async (g: RuleGroup, outbound: string) => {
-    try {
-      await api.selectGroup(g.id, outbound);
-      patchLocal((p) => ({ ...p, groups: p.groups.map((x) => (x.id === g.id ? { ...x, outbound } : x)) }));
+  // Both apply live: the backend switches the running core's selector / mode.
+  const selectGroup = (g: RuleGroup, outbound: string) =>
+    updateProfile((p) => ({ ...p, groups: p.groups.map((x) => (x.id === g.id ? { ...x, outbound } : x)) })).then(() => {
       if (running) refreshProxies();
-    } catch (e) {
-      toast(errorText(e), "error");
-    }
-  };
-
-  const setMode = async (mode: Mode) => {
-    try {
-      await api.setMode(mode);
-      patchLocal((p) => ({ ...p, mode }));
-    } catch (e) {
-      toast(errorText(e), "error");
-    }
-  };
+    });
+  const setMode = (mode: Mode) => updateProfile((p) => ({ ...p, mode }));
 
   const connCount = (g: RuleGroup) => conns.filter((c) => c.chains.includes(groupSelectorTag(g))).length;
 
@@ -89,13 +53,15 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
             ? `已連線 ${formatElapsed(core.started_at * 1000)}`
             : core.state === "error"
               ? "連線發生錯誤"
-              : core.state === "starting"
-                ? "連線中…"
-                : "未連線"
+              : core.state === "reconnecting"
+                ? `核心意外結束，正在自動重新連線（第 ${core.attempt} 次）`
+                : core.state === "starting"
+                  ? "連線中…"
+                  : "未連線"
         }
       />
       <div className="min-h-0 flex-1 space-y-4 overflow-auto p-6">
-        {core.state === "error" && (
+        {(core.state === "error" || core.state === "reconnecting") && (
           <div className="selectable rounded-lg border border-danger/40 bg-danger-soft px-4 py-3 text-[13px] whitespace-pre-wrap text-danger">{core.message}</div>
         )}
 
@@ -105,8 +71,8 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
             value={defaultNow ?? (running ? "測試中…" : (nodeName(profile.selected) ?? "—"))}
             hint={profile.selected === "auto" ? "自動選擇最低延遲" : profile.selected === "direct" ? "不經過代理" : "手動指定"}
           />
-          <Stat label="上傳" value={running ? formatRate(rates.up) : "—"} hint={running ? `累計 ${formatBytes(rates.upTotal)}` : undefined} icon={<ArrowUp size={14} />} />
-          <Stat label="下載" value={running ? formatRate(rates.down) : "—"} hint={running ? `累計 ${formatBytes(rates.downTotal)}` : undefined} icon={<ArrowDown size={14} />} />
+          <Stat label="上傳" value={traffic ? formatRate(traffic.up_rate) : "—"} hint={traffic ? `累計 ${formatBytes(traffic.upload_total)}` : undefined} icon={<ArrowUp size={14} />} />
+          <Stat label="下載" value={traffic ? formatRate(traffic.down_rate) : "—"} hint={traffic ? `累計 ${formatBytes(traffic.download_total)}` : undefined} icon={<ArrowDown size={14} />} />
           <Stat label="連線數" value={running ? String(conns.length) : "—"} hint="目前開啟中的連線" />
         </div>
 

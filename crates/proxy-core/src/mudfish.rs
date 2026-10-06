@@ -24,7 +24,8 @@ struct RawNode {
 }
 
 /// A node from the Mudfish list, with `location` split into display parts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
 pub struct MudfishNode {
     pub sid: u32,
     pub hostname: String,
