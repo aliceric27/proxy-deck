@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+/* Semantic tokens; light by default, dark follows the OS. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --border: #e2e5ea;
+  --text: #1d2330;
+  --muted: #667085;
+  --accent: #0e7c86;
+  --accent-soft: #e3f4f5;
+  --accent-text: #ffffff;
+  --ok: #138a4c;
+  --ok-soft: #e4f5ec;
+  --warn: #b25e09;
+  --warn-soft: #fdf1e3;
+  --danger: #c4312b;
+  --danger-soft: #fdebea;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b;
+    --surface: #1a1e26;
+    --surface-2: #222733;
+    --border: #2d3340;
+    --text: #e6e9ef;
+    --muted: #8d96a8;
+    --accent: #3cb4be;
+    --accent-soft: #163a3e;
+    --accent-text: #0b1416;
+    --ok: #3ecf83;
+    --ok-soft: #173326;
+    --warn: #f0a24b;
+    --warn-soft: #3a2a17;
+    --danger: #f2675f;
+    --danger-soft: #3d1c1b;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-text: var(--accent-text);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft JhengHei UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Microsoft JhengHei UI", monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

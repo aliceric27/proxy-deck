@@ -1,0 +1,6 @@
+# Sources are authored with LF; keep them LF on checkout (entrypoint.sh must stay LF for Docker).
+* text=auto eol=lf
+*.srs binary
+*.png binary
+*.ico binary
+*.icns binary

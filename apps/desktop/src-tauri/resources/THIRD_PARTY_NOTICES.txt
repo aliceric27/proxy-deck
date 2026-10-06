@@ -1,0 +1,14 @@
+ProxyDesk bundles the following third-party components.
+
+sing-box 1.14.2
+  License: GNU General Public License v3.0 or later
+  Source: https://github.com/SagerNet/sing-box/tree/v1.14.2
+  Distributed as the unmodified official Windows release binary (sing-box.exe),
+  run as a separate process. ProxyDesk does not link against it.
+
+Rule sets (resources/rulesets: geosite, geoip, acl .srs files)
+  Taken from the Karing project (https://github.com/KaringX/karing) for development builds.
+  Upstream sources include v2fly/domain-list-community (MIT), SagerNet sing-geoip
+  (GPL-3.0, derived from MaxMind GeoLite2 / ipinfo data) and ACL4SSR rule lists.
+  Release builds should compile these from upstream with their licenses attached
+  (see docs/PLAN.md §10).

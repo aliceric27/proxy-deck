@@ -1,0 +1,9 @@
+# Mudfish credentials for local scripts — never commit
+.env.local
+
+node_modules/
+target/
+dist/
+
+# sing-box sidecar (80 MB); fetched by scripts/fetch-singbox.ps1
+apps/desktop/src-tauri/binaries/

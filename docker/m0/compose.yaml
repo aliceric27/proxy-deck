@@ -1,0 +1,16 @@
+services:
+  m0:
+    build: .
+    image: proxydesk-m0
+    # default bridge (not a compose network) so /etc/resolv.conf points at 1.1.1.1 instead of
+    # Docker's 127.0.0.11 loopback resolver, which would bypass the TUN and the DNS hijack
+    network_mode: bridge
+    dns: [1.1.1.1]
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+    env_file: ../../.env.local
+    environment:
+      CLASH_SECRET: m0-dev-secret
+    tmpfs: [/run/m0]
