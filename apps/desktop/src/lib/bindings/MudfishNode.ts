@@ -7,4 +7,15 @@ export type MudfishNode = { sid: number, hostname: string, ip: string, location:
 /**
  * ISO 3166-1 alpha-2, upper case (first two characters of `location`).
  */
-country: string, region: string, city: string, provider: string, commercial: boolean, premium: boolean, };
+country: string, region: string, city: string, provider: string, 
+/**
+ * `commercial_node`: paid node (`false` = free node). Classification only, per Mudfish
+ * support (2026-10-06): neither flag says anything about SOCKS5 support or availability.
+ */
+commercial: boolean, 
+/**
+ * `commercial_node_premium_enabled`: Premium node, an access restriction of some
+ * subscription plans (`false` does not mean free). Pay-Per-Traffic accounts with credit
+ * can use Premium nodes without a Premium subscription, so it never excludes a node.
+ */
+premium: boolean, };

@@ -200,7 +200,16 @@ export default function Nodes() {
                         </td>
                         <td className="py-1.5">
                           <span className="mr-1.5">{n.provider}</span>
-                          {n.premium && <Badge tone="accent">Premium</Badge>}
+                          {n.premium && (
+                            <span title="Premium 是部分訂閱方案的存取限制標記。使用流量計費（PPT）且有餘額時可直接使用，不需另購 Premium 訂閱。">
+                              <Badge tone="accent">Premium</Badge>
+                            </span>
+                          )}
+                          {!n.commercial && (
+                            <span title="Mudfish 標示的免費節點。">
+                              <Badge tone="ok">免費</Badge>
+                            </span>
+                          )}
                         </td>
                         <td className="selectable py-1.5 font-mono text-xs text-muted">{n.ip}</td>
                         <td className="tabular py-1.5 pr-6 text-right">

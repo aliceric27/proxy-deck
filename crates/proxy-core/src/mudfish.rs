@@ -36,7 +36,12 @@ pub struct MudfishNode {
     pub region: String,
     pub city: String,
     pub provider: String,
+    /// `commercial_node`: paid node (`false` = free node). Classification only, per Mudfish
+    /// support (2026-10-06): neither flag says anything about SOCKS5 support or availability.
     pub commercial: bool,
+    /// `commercial_node_premium_enabled`: Premium node, an access restriction of some
+    /// subscription plans (`false` does not mean free). Pay-Per-Traffic accounts with credit
+    /// can use Premium nodes without a Premium subscription, so it never excludes a node.
     pub premium: bool,
 }
 
