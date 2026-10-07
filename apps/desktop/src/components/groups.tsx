@@ -18,6 +18,7 @@ export function newGroup(partial: Partial<RuleGroup> = {}): RuleGroup {
     rule_sets: [],
     ip_cidrs: [],
     udp: "follow",
+    match_mode: "any",
     ...partial,
   };
 }
@@ -42,13 +43,18 @@ export function matcherCounts(g: RuleGroup): Record<MatcherKind, number> {
 
 export const isGroupEmpty = (g: RuleGroup) => Object.values(matcherCounts(g)).every((n) => n === 0);
 
-/** Compact "icon + count" chips for each matcher kind present in the group. */
+/** Compact "icon + count" chips for each matcher kind present in the group; an AND group is tagged first. */
 export function MatcherSummary({ group }: { group: RuleGroup }) {
   const counts = matcherCounts(group);
   const kinds = (Object.keys(counts) as MatcherKind[]).filter((k) => counts[k] > 0);
   if (!kinds.length) return <span className="text-[11px] text-warn">尚未設定條件</span>;
   return (
     <span className="flex items-center gap-2.5 text-[11px] text-muted">
+      {group.match_mode === "all" && (
+        <span className="rounded bg-surface-2 px-1 text-[10px] font-medium text-muted" title="需符合全部條件">
+          AND
+        </span>
+      )}
       {kinds.map((k) => (
         <span key={k} className="inline-flex items-center gap-1" title={MATCHER_META[k].label}>
           {MATCHER_META[k].icon}
@@ -59,7 +65,8 @@ export function MatcherSummary({ group }: { group: RuleGroup }) {
   );
 }
 
-/** First few concrete matcher values, for the row subtitle. */
+/** First few concrete matcher values, for the row subtitle. The AND/OR signal is the `MatcherSummary`
+ * tag, not this list, because the flattened values cross kinds (which AND) and same-kind values (which OR). */
 export function matcherPreview(g: RuleGroup, max = 5): string {
   const items = [
     ...g.process_names,

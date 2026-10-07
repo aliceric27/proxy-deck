@@ -156,6 +156,28 @@ impl ClashClient {
         self.send(self.http.delete(self.url("/connections"))).await.map(|_| ())
     }
 
+    /// Closes the connections a live selector switch replaced: those whose chain still shows the
+    /// selector pointing at its *previous* member. Chains run leaf outbound → selector, so the
+    /// member a selector used sits right before it; a connection re-dialed onto the new member has
+    /// the new member there instead and is left alone. `switches` is `(selector, old_member)`.
+    /// Best-effort: a connection already gone (sing-box's own `interrupt_exist_connections` is
+    /// faster) is fine.
+    pub async fn close_switched_connections(&self, switches: &[(String, String)]) -> Result<(), String> {
+        if switches.is_empty() {
+            return Ok(());
+        }
+        let conns = self.connections().await?;
+        for c in &conns.connections {
+            let replaced = switches
+                .iter()
+                .any(|(selector, old)| c.chains.iter().position(|t| t == selector).is_some_and(|i| i > 0 && &c.chains[i - 1] == old));
+            if replaced {
+                let _ = self.close_connection(&c.id).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Switches the Clash mode and confirms it: sing-box answers 204 even when it ignores a
     /// mode that is not in its mode list.
     pub async fn set_mode(&self, mode: &str) -> Result<(), String> {

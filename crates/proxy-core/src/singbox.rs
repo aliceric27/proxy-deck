@@ -6,8 +6,9 @@
 //!
 //! Matching semantics (sing-box route/rule/rule_abstract.go): inside one default rule,
 //! `process_name`, `process_path`, `process_path_regex`, `network`, `port` and `rule_set`
-//! are ANDed, while domain fields OR among themselves. A group means "any of its matchers",
-//! so each matcher kind is emitted as its own sub-rule under a logical OR.
+//! are ANDed, while domain fields OR among themselves. A group combines its matcher kinds by
+//! its match mode (any of them, or all of them), so each kind is emitted as its own sub-rule
+//! under a logical OR or AND.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -194,29 +195,56 @@ fn domain_rule(g: &RuleGroup) -> Option<Map<String, Value>> {
     (!m.is_empty()).then_some(m)
 }
 
-/// One sub-rule per matcher kind; the group matches if any of them does.
-fn group_matchers(g: &RuleGroup) -> Vec<Value> {
-    let mut out = Vec::new();
-    let mut single = |key: &str, items: &[String]| {
-        let mut m = Map::new();
-        put_list(&mut m, key, items);
-        if !m.is_empty() {
-            out.push(Value::Object(m));
-        }
-    };
-    single("process_name", &g.process_names);
-    // Exact paths and directories both become case-insensitive regexes: Windows paths are
-    // case-insensitive, and a path typed by hand may differ in case from the one sing-box reports.
-    let regexes: Vec<String> = g
-        .process_paths
+/// A `{ key: items }` matcher object, or `None` once empty values are trimmed away.
+fn field_rule(key: &str, items: &[String]) -> Option<Value> {
+    let mut m = Map::new();
+    put_list(&mut m, key, items);
+    (!m.is_empty()).then_some(Value::Object(m))
+}
+
+/// A group's `process_path_regex` values: exact paths and directories, both case-insensitive
+/// (Windows paths are case-insensitive, and a hand-typed path may differ in case from sing-box's).
+fn process_path_regexes(g: &RuleGroup) -> Vec<String> {
+    g.process_paths
         .iter()
         .filter(|p| !p.trim().is_empty())
         .map(|p| path_regex(p))
         .chain(g.directories.iter().filter(|d| !d.trim().is_empty()).map(|d| directory_regex(d)))
-        .collect();
-    single("process_path_regex", &regexes);
-    single("ip_cidr", &g.ip_cidrs);
-    single("rule_set", &rule_set_tags(&g.rule_sets, false));
+        .collect()
+}
+
+/// The "app" matcher kind as separate sub-rules: a process-name rule and a path/dir-regex rule.
+/// They are separate because sing-box ANDs `process_name` with `process_path_regex` inside one rule.
+fn app_rules(g: &RuleGroup) -> Vec<Value> {
+    [field_rule("process_name", &g.process_names), field_rule("process_path_regex", &process_path_regexes(g))]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// One sub-rule per sing-box field, fixed order (app name, app path, IP, rule set, domain). The OR
+/// path ORs them all; kept byte-for-byte so existing profiles keep the same config and fingerprint.
+fn group_matchers(g: &RuleGroup) -> Vec<Value> {
+    let mut out = app_rules(g);
+    out.extend(field_rule("ip_cidr", &g.ip_cidrs));
+    out.extend(field_rule("rule_set", &rule_set_tags(&g.rule_sets, false)));
+    if let Some(d) = domain_rule(g) {
+        out.push(Value::Object(d));
+    }
+    out
+}
+
+/// One sub-rule per user-facing matcher kind (app, IP, rule set, domain), with the app kind's own
+/// name/path/dir values OR-ed into a single sub-rule. The AND path ANDs these, so the kinds must
+/// all match while a kind's own values still match any-of (e.g. "this app by name *or* folder").
+fn group_kind_matchers(g: &RuleGroup) -> Vec<Value> {
+    let mut out = Vec::new();
+    let app = app_rules(g);
+    if !app.is_empty() {
+        out.push(any_of(app));
+    }
+    out.extend(field_rule("ip_cidr", &g.ip_cidrs));
+    out.extend(field_rule("rule_set", &rule_set_tags(&g.rule_sets, false)));
     if let Some(d) = domain_rule(g) {
         out.push(Value::Object(d));
     }
@@ -230,6 +258,31 @@ fn any_of(mut subs: Vec<Value>) -> Value {
     } else {
         json!({ "type": "logical", "mode": "or", "rules": subs })
     }
+}
+
+/// Collapses sub-rules into one AND matcher: the rule itself if there is one, else logical AND.
+fn all_of(mut subs: Vec<Value>) -> Value {
+    if subs.len() == 1 {
+        subs.pop().unwrap()
+    } else {
+        json!({ "type": "logical", "mode": "and", "rules": subs })
+    }
+}
+
+/// A group's matcher. OR keeps the historical flat shape; AND combines one sub-rule per user-facing
+/// kind, so the kinds AND while each kind's own values (the app names/paths especially) still OR.
+fn group_matcher_expr(g: &RuleGroup) -> Value {
+    match g.match_mode {
+        MatchMode::Any => any_of(group_matchers(g)),
+        MatchMode::All => all_of(group_kind_matchers(g)),
+    }
+}
+
+/// A group is a true AND only when it has two or more populated matcher kinds; with one kind
+/// `all` and `any` emit the identical rule, so FakeIP and the QUIC block still apply to it. The
+/// gates below use this rather than `match_mode` alone so a pointless one-kind AND is not punished.
+fn is_multi_kind_and(g: &RuleGroup) -> bool {
+    g.match_mode == MatchMode::All && group_kind_matchers(g).len() >= 2
 }
 
 fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
@@ -255,7 +308,12 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
     if fake {
         dns_rules.push(json!({ "clash_mode": "Global", "query_type": ["A", "AAAA"], "action": "route", "server": DNS_FAKEIP }));
     }
-    for g in groups.iter().filter(|g| profile.is_proxied(&g.outbound)) {
+    // A multi-kind AND group gets no FakeIP rule. It claims a domain only together with its other
+    // conditions (say, one app), but a DNS rule cannot see which app is asking: FakeIP keyed on
+    // the domain alone would hand every app a fake IP for it. Other apps would then reach that
+    // domain without the real IP GeoIP matches on, and miss the group's route rule as well. So an
+    // AND group's domain resolves for real and is matched by the SNI/Host that sniffing finds.
+    for g in groups.iter().filter(|g| profile.is_proxied(&g.outbound) && !is_multi_kind_and(g)) {
         if let Some(mut m) = domain_rule(g) {
             m.insert("query_type".into(), json!(["A", "AAAA"]));
             m.insert("action".into(), json!("route"));
@@ -394,10 +452,12 @@ fn route(profile: &Profile, groups: &[&RuleGroup], geoip: &[String], rule_sets: 
 
     for g in groups {
         let proxied = profile.is_proxied(&g.outbound);
-        if proxied && g.udp == UdpPolicy::Follow && profile.dns.block_quic_for_proxied {
+        // The QUIC block names the group's domains alone, which is only right while the domain
+        // decides the group's traffic: not for a multi-kind AND group (it also needs its app/IP).
+        if proxied && !is_multi_kind_and(g) && g.udp == UdpPolicy::Follow && profile.dns.block_quic_for_proxied {
             out.extend(quic_block(g));
         }
-        let matcher = any_of(group_matchers(g));
+        let matcher = group_matcher_expr(g);
         if proxied && g.udp != UdpPolicy::Follow {
             let mut udp_rule = json!({ "type": "logical", "mode": "and", "rules": [{ "network": ["udp"] }, matcher.clone()] });
             with_action(&mut udp_rule, if g.udp == UdpPolicy::Direct { Action::Direct } else { Action::Reject });
@@ -451,8 +511,9 @@ fn selector_action(profile: &Profile, outbound: &str, selector: &str) -> Action 
 /// proxy. Emitted right before the group's own rule, so a higher-priority group that sends the
 /// same domain direct still wins. Domains and rule sets are separate sub-rules because
 /// `rule_set` is ANDed with the domain fields inside a single rule. The caller emits it only
-/// for proxied groups whose UDP follows the group: with their own UDP policy they keep it
-/// (UDP direct lets QUIC work directly; UDP reject already covers it).
+/// for proxied OR groups whose UDP follows the group: with their own UDP policy they keep it
+/// (UDP direct lets QUIC work directly; UDP reject already covers it), and an AND group's
+/// domain alone does not decide its traffic.
 fn quic_block(g: &RuleGroup) -> Option<Value> {
     let mut subs = Vec::new();
     if let Some(d) = domain_rule(g) {
@@ -870,6 +931,111 @@ mod tests {
         assert!(rules(&c).iter().any(|r| r["action"] == "reject" && r["type"] == "logical"));
     }
 
+    /// An AND group needs every populated matcher kind: one logical AND of the per-kind sub-rules.
+    /// Its domain cannot decide on its own, so the group gets neither a FakeIP rule nor a QUIC block.
+    #[test]
+    fn and_group_matches_every_kind() {
+        let dir = ruleset_dir();
+        let mut g = RuleGroup::new("both", "both", "mudfish-591");
+        g.match_mode = MatchMode::All;
+        g.process_names = vec!["game.exe".into()];
+        g.domain_suffixes = vec!["example.com".into()];
+        g.ip_cidrs = vec!["1.2.3.0/24".into()];
+        let and = Profile { nodes: vec![node(591)], groups: vec![g], ..Profile::default() };
+
+        let c = generate(&and, &opts(&dir)).unwrap();
+        let r = rules(&c);
+        // sniff, hijack-dns, bypass LAN and the two mode switches, then the group, then GeoIP
+        let rule = &r[5];
+        assert_eq!(rule["type"], "logical");
+        assert_eq!(rule["mode"], "and");
+        assert_eq!((rule["action"].as_str(), rule["outbound"].as_str()), (Some("route"), Some("group-both")));
+        let subs = rule["rules"].as_array().unwrap();
+        assert_eq!(subs.len(), 3, "one sub-rule per kind: app, IP and domain");
+        assert!(subs.contains(&json!({ "process_name": ["game.exe"] })));
+        assert!(subs.contains(&json!({ "ip_cidr": ["1.2.3.0/24"] })));
+        assert!(subs.contains(&json!({ "domain_suffix": ["example.com"] })));
+        assert_eq!(r.len(), 7, "no QUIC block rule in front of it");
+        assert!(r.iter().all(|x| x["action"] != "reject"));
+        let dns = c["dns"]["rules"].as_array().unwrap();
+        assert_eq!(dns.len(), 3, "only the Direct, Global and Rule mode rules: no FakeIP for its domain");
+        assert!(dns.iter().all(|d| d.get("domain_suffix").is_none()));
+
+        // The same conditions as OR get both, so the checks above are not vacuous.
+        let mut or = and.clone();
+        or.groups[0].match_mode = MatchMode::Any;
+        let c = generate(&or, &opts(&dir)).unwrap();
+        assert_eq!(c["dns"]["rules"].as_array().unwrap().len(), 4, "FakeIP rule for the domain");
+        assert!(rules(&c).iter().any(|x| x["action"] == "reject" && x["type"] == "logical"), "QUIC block");
+        assert_eq!(rules(&c)[6]["mode"], "or");
+        assert_ne!(restart_fingerprint(&and, &dir), restart_fingerprint(&or, &dir), "switching the mode needs a reconnect");
+
+        // With a UDP policy of its own, the UDP guard wraps the AND matcher (and still no QUIC block).
+        let mut guarded = and.clone();
+        guarded.groups[0].udp = UdpPolicy::Direct;
+        let c = generate(&guarded, &opts(&dir)).unwrap();
+        let (guard, rule) = (&rules(&c)[5], &rules(&c)[6]);
+        assert_eq!((guard["mode"].as_str(), guard["outbound"].as_str()), (Some("and"), Some("direct")));
+        assert_eq!(guard["rules"][0], json!({ "network": ["udp"] }));
+        assert_eq!((guard["rules"][1]["type"].as_str(), guard["rules"][1]["mode"].as_str()), (Some("logical"), Some("and")));
+        assert_eq!(rule["outbound"], "group-both");
+        assert_eq!(rules(&c).len(), 8);
+    }
+
+    /// With one populated kind there is nothing to AND: the rule is the same in either mode.
+    #[test]
+    fn a_single_kind_is_the_same_rule_in_either_mode() {
+        let mut g = RuleGroup::new("one", "one", TAG_AUTO);
+        g.process_names = vec!["a.exe".into()];
+        let any = group_matcher_expr(&g);
+        g.match_mode = MatchMode::All;
+        assert_eq!(group_matcher_expr(&g), any);
+        assert_eq!(any, json!({ "process_name": ["a.exe"] }));
+    }
+
+    /// A one-kind AND group is identical to the OR version, so it must keep FakeIP and the QUIC
+    /// block (only a genuine multi-kind AND loses them).
+    #[test]
+    fn single_kind_and_group_keeps_fakeip_and_quic_block() {
+        let dir = ruleset_dir();
+        let mut g = RuleGroup::new("d", "d", "mudfish-591");
+        g.match_mode = MatchMode::All;
+        g.domain_suffixes = vec!["example.com".into()];
+        let p = Profile { nodes: vec![node(591)], groups: vec![g], ..Profile::default() };
+        let c = generate(&p, &opts(&dir)).unwrap();
+        assert!(
+            c["dns"]["rules"].as_array().unwrap().iter().any(|d| d.get("domain_suffix").is_some()),
+            "FakeIP for the lone domain, same as OR"
+        );
+        assert!(rules(&c).iter().any(|x| x["action"] == "reject" && x["type"] == "logical"), "QUIC block, same as OR");
+        assert!(!is_multi_kind_and(&p.groups[0]));
+    }
+
+    /// In AND mode the "app" kind (names, paths, folders) still ORs internally: only the kinds AND,
+    /// so "this app by name or folder, AND this IP" matches the app either way it is named.
+    #[test]
+    fn and_mode_ors_within_the_app_kind() {
+        let dir = ruleset_dir();
+        let mut g = RuleGroup::new("app-ip", "app-ip", "mudfish-591");
+        g.match_mode = MatchMode::All;
+        g.process_names = vec!["game.exe".into()];
+        g.directories = vec![r"C:\Riot Games".into()];
+        g.ip_cidrs = vec!["1.2.3.0/24".into()];
+        let p = Profile { nodes: vec![node(591)], groups: vec![g], ..Profile::default() };
+        let c = generate(&p, &opts(&dir)).unwrap();
+        // sniff, hijack-dns, bypass LAN, the two mode switches, then the group
+        let rule = &rules(&c)[5];
+        assert_eq!((rule["type"].as_str(), rule["mode"].as_str()), (Some("logical"), Some("and")));
+        let subs = rule["rules"].as_array().unwrap();
+        assert_eq!(subs.len(), 2, "two kinds: app and IP");
+        let app = subs.iter().find(|s| s["mode"] == "or").expect("the app kind is an inner OR of name and path");
+        let app_subs = app["rules"].as_array().unwrap();
+        assert!(app_subs.iter().any(|s| s.get("process_name").is_some()), "app matches by name");
+        assert!(app_subs.iter().any(|s| s.get("process_path_regex").is_some()), "...or by folder");
+        assert!(subs.iter().any(|s| s.get("ip_cidr").is_some()), "ANDed with the IP kind");
+        assert!(is_multi_kind_and(&p.groups[0]));
+    }
+
     /// A v0.4 file with one group that followed the default node and blocked its UDP.
     fn v2_group_with_udp_policy(selected: &str) -> String {
         format!(
@@ -1165,18 +1331,35 @@ mod tests {
         let mut o = opts(&dir);
         o.wireguard_keys = &keys;
         o.self_exe = Some(r"C:\Program Files\ProxyDesk\proxydesk.exe");
-        // (FakeIP, final, GeoIP outbound, GeoIP countries)
+        // AND groups with app + domain + IP, one of them with a UDP policy of its own: the logical
+        // `and`, and the UDP guard wrapped around it, must pass the real validator too.
+        let and_group = |id: &str, udp: UdpPolicy| {
+            let mut g = RuleGroup::new(id, id, "mudfish-655");
+            g.match_mode = MatchMode::All;
+            g.process_names = vec!["game.exe".into()];
+            g.domain_suffixes = vec!["example.com".into()];
+            g.ip_cidrs = vec!["1.2.3.0/24".into()];
+            g.udp = udp;
+            g
+        };
+        let or_groups = p.groups.clone();
+        // (FakeIP, final, GeoIP outbound, GeoIP countries, with the AND groups)
         let cases = [
-            (true, TAG_DIRECT, "warp-test", vec!["tw"]),
-            (false, "mudfish-591", TAG_AUTO, vec!["tw", "jp"]),
-            (true, TAG_REJECT, TAG_DIRECT, vec!["tw"]),
-            (true, TAG_AUTO, TAG_REJECT, vec!["tw"]),
-            (true, TAG_DIRECT, TAG_DIRECT, vec![]),
+            (true, TAG_DIRECT, "warp-test", vec!["tw"], false),
+            (false, "mudfish-591", TAG_AUTO, vec!["tw", "jp"], false),
+            (true, TAG_REJECT, TAG_DIRECT, vec!["tw"], false),
+            (true, TAG_AUTO, TAG_REJECT, vec!["tw"], false),
+            (true, TAG_DIRECT, TAG_DIRECT, vec![], false),
+            (true, TAG_DIRECT, TAG_AUTO, vec!["tw"], true),
         ];
-        for (i, (fakeip, final_outbound, geoip_outbound, countries)) in cases.into_iter().enumerate() {
+        for (i, (fakeip, final_outbound, geoip_outbound, countries, with_and)) in cases.into_iter().enumerate() {
             p.dns.fakeip = fakeip;
             p.final_outbound = final_outbound.into();
             p.geoip = GeoIpGroup { countries: countries.into_iter().map(String::from).collect(), outbound: geoip_outbound.into() };
+            p.groups = or_groups.clone();
+            if with_and {
+                p.groups.extend([and_group("both", UdpPolicy::Follow), and_group("both-udp", UdpPolicy::Direct)]);
+            }
             let c = generate(&p, &o).unwrap();
             let path = std::env::temp_dir().join(format!("proxydesk-check-{i}.json"));
             std::fs::write(&path, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
@@ -1184,7 +1367,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             assert!(
                 out.status.success(),
-                "sing-box check failed for case {i} ({final_outbound}, GeoIP {geoip_outbound}, FakeIP {fakeip}): {}",
+                "sing-box check failed for case {i} ({final_outbound}, GeoIP {geoip_outbound}, FakeIP {fakeip}, AND groups {with_and}): {}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }

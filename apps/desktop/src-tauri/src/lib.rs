@@ -2,6 +2,7 @@ mod clash;
 mod commands;
 mod core;
 mod credentials;
+mod mudfish_probe;
 mod nodes;
 mod paths;
 mod store;
@@ -142,6 +143,7 @@ pub fn run() {
             commands::save_profile,
             commands::set_credentials,
             commands::clear_credentials,
+            commands::verify_account,
             commands::get_nodes,
             commands::warp_create,
             commands::warp_discard,

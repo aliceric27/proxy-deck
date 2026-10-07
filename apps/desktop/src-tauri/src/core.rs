@@ -67,6 +67,10 @@ pub trait Launcher: Send + Sync + 'static {
     fn spawn<'a>(&'a self, config: &'a [u8], log: mpsc::UnboundedSender<String>) -> BoxFut<'a, Result<Child, String>>;
     fn healthy<'a>(&'a self, clash: &'a ClashClient) -> BoxFut<'a, bool>;
     fn apply<'a>(&'a self, clash: &'a ClashClient, ops: &'a [LiveOp]) -> BoxFut<'a, Result<(), String>>;
+    /// Drops the connections a live selector switch replaced — those still on a selector's previous
+    /// member, given as `(selector, old_member)` pairs — so the switch bites existing connections
+    /// too, without touching ones re-dialed onto the new member. Best-effort.
+    fn interrupt<'a>(&'a self, clash: &'a ClashClient, switches: &'a [(String, String)]) -> BoxFut<'a, ()>;
     /// After the core is gone (stopped or crashed): undo system side effects.
     fn cleanup(&self) -> BoxFut<'_, ()>;
     /// Kills cores left over from a previous crash of the app. Blocking.
@@ -402,20 +406,41 @@ impl CoreManager {
         Ok(())
     }
 
-    /// Records the profile's live choices and applies the changes to a running core.
+    /// Records the profile's live choices and applies the changes to a running core. A switched
+    /// selector also loses its existing connections, so they re-dial through the new choice.
     pub async fn set_selections(&self, desired: Selections) -> Result<(), String> {
         let _live = self.live.lock().await;
-        let (clash, ops) = {
+        let (clash, ops, switched) = {
             let mut inner = self.inner.lock().await;
             inner.desired = desired.clone();
             match (&inner.run, &inner.status, &inner.plan) {
                 (Some(run), Some(CoreStatus::Running { .. }), Some(plan)) => {
-                    (run.clash.clone(), applicable(plan, diff(inner.live.as_ref(), &desired)))
+                    let ops = applicable(plan, diff(inner.live.as_ref(), &desired));
+                    // The previous member of each selector we are actually switching, so the backstop
+                    // drops only the connections the switch replaced. Known only when `live` is: after
+                    // a failed apply `live` is None and `diff` re-sends every selector unchanged —
+                    // those are no-ops in the core, so there is nothing to interrupt.
+                    let switched: Vec<(String, String)> = match &inner.live {
+                        Some(live) => ops
+                            .iter()
+                            .filter_map(|o| match o {
+                                LiveOp::Select { selector, .. } => live.selectors.get(selector).map(|old| (selector.clone(), old.clone())),
+                                _ => None,
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    (run.clash.clone(), ops, switched)
                 }
                 _ => return Ok(()), // applied after the next (re)start
             }
         };
         let result = if ops.is_empty() { Ok(()) } else { self.launcher.apply(&clash, &ops).await };
+        // After a successful switch, drop the connections still on each selector's old member so the
+        // change bites existing connections at once. A mode change closed everything via CloseAll.
+        if result.is_ok() && !switched.is_empty() && !ops.iter().any(|o| matches!(o, LiveOp::CloseAll)) {
+            self.launcher.interrupt(&clash, &switched).await;
+        }
         let mut inner = self.inner.lock().await;
         match &result {
             Ok(()) => {
@@ -705,6 +730,12 @@ impl Launcher for SingBox {
         })
     }
 
+    fn interrupt<'a>(&'a self, clash: &'a ClashClient, switches: &'a [(String, String)]) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let _ = clash.close_switched_connections(switches).await;
+        })
+    }
+
     fn cleanup(&self) -> BoxFut<'_, ()> {
         Box::pin(async move {
             // FakeIP answers cached by Windows would point at the now-closed TUN.
@@ -820,8 +851,12 @@ mod tests {
         exits: std::sync::Mutex<Vec<oneshot::Sender<String>>>,
         current_healthy: std::sync::atomic::AtomicBool,
         applied: std::sync::Mutex<Vec<LiveOp>>,
+        /// `(selector, old_member)` pairs whose connections were dropped after a live switch.
+        interrupted: std::sync::Mutex<Vec<(String, String)>>,
         /// The next apply kills the process mid-way (it died while selections were sent).
         crash_in_apply: std::sync::atomic::AtomicBool,
+        /// While set, apply returns an error without the process dying (a transient Clash hiccup).
+        fail_apply: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -865,13 +900,21 @@ mod tests {
             if crash {
                 self.crash();
             }
+            let fail = self.fail_apply.load(Ordering::SeqCst);
             Box::pin(async move {
                 if crash {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     return Err("connection refused".into());
                 }
+                if fail {
+                    return Err("clash hiccup".into());
+                }
                 Ok(())
             })
+        }
+        fn interrupt<'a>(&'a self, _: &'a ClashClient, switches: &'a [(String, String)]) -> BoxFut<'a, ()> {
+            self.interrupted.lock().unwrap().extend(switches.iter().cloned());
+            Box::pin(async {})
         }
         fn cleanup(&self) -> BoxFut<'_, ()> {
             self.cleanups.fetch_add(1, Ordering::SeqCst);
@@ -943,11 +986,15 @@ mod tests {
         fake.applied.lock().unwrap().clear();
         m.set_selections(sel("direct")).await.unwrap();
         assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "final".into(), outbound: "direct".into() }]);
+        // ...and the connections still on final's old member (`auto`) are dropped, so the switch bites at once
+        assert_eq!(*fake.interrupted.lock().unwrap(), vec![("final".to_string(), "auto".to_string())]);
+        fake.interrupted.lock().unwrap().clear();
         let mut global = sel("direct");
         global.mode = Mode::Global;
         fake.applied.lock().unwrap().clear();
         m.set_selections(global).await.unwrap();
         assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Mode(Mode::Global), LiveOp::CloseAll]);
+        assert!(fake.interrupted.lock().unwrap().is_empty(), "a mode change closed everything already: no per-selector interrupt");
 
         m.stop().await;
         assert_eq!(m.status().await, CoreStatus::Stopped);
@@ -986,7 +1033,30 @@ mod tests {
         s.selectors.insert("group-a".into(), "auto".into());
         m.set_selections(s).await.unwrap();
         assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "group-a".into(), outbound: "auto".into() }]);
+        assert_eq!(
+            *fake.interrupted.lock().unwrap(),
+            vec![("group-a".to_string(), "direct".to_string())],
+            "only a switch that was really sent drops connections, and only those on its old member"
+        );
         assert!(!m.is_stale(Some("fp")).await, "skipped switches are not failures");
+    }
+
+    #[tokio::test]
+    async fn resync_after_a_failed_apply_does_not_interrupt() {
+        let (m, fake, _) = setup();
+        m.start(plan("fp"), sel("auto")).await.unwrap();
+        fake.fail_apply.store(true, Ordering::SeqCst);
+        let _ = m.set_selections(sel("direct")).await; // apply fails → live becomes unknown (None)
+        assert!(m.is_stale(Some("fp")).await, "a failed live apply marks the session stale");
+        fake.fail_apply.store(false, Ordering::SeqCst);
+        fake.interrupted.lock().unwrap().clear();
+        // A later save re-sends every selector (live is None) but they are no-ops in the core, so
+        // nothing was really switched: the backstop must not drop any connection.
+        m.set_selections(sel("direct")).await.unwrap();
+        assert!(
+            fake.interrupted.lock().unwrap().is_empty(),
+            "a resync of unchanged selectors after a hiccup must not disconnect anything"
+        );
     }
 
     #[tokio::test]

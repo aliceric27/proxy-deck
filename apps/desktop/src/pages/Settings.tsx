@@ -105,6 +105,7 @@ function AccountCard({ username, onChanged }: { username: string | null; onChang
   const [user, setUser] = useState(username ?? "");
   const [pass, setPass] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
 
   const save = async () => {
     setSaving(true);
@@ -118,6 +119,21 @@ function AccountCard({ username, onChanged }: { username: string | null; onChang
       toast(errorText(e), "error");
     } finally {
       setSaving(false);
+    }
+  };
+
+  /** Auth only, so it costs no traffic. Mudfish answers a wrong password and an account without credit the same way. */
+  const verify = async () => {
+    setTesting(true);
+    try {
+      const result = await api.verifyAccount();
+      if (result === "usable") toast("帳號可用（已通過節點認證）", "success");
+      else if (result === "unusable") toast("帳號無法使用：密碼錯誤，或 Mudfish 餘額不足。兩者的回應相同，請一併確認密碼與餘額。", "error");
+      else toast("目前連不到任何節點，無法測試，請稍後再試。", "error");
+    } catch (e) {
+      toast(errorText(e), "error");
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -170,6 +186,9 @@ function AccountCard({ username, onChanged }: { username: string | null; onChang
               <span className="font-medium">{username}</span>
             </div>
             <div className="flex gap-2">
+              <Button size="sm" disabled={testing} onClick={verify}>
+                {testing ? "測試中…" : "測試帳號"}
+              </Button>
               <Button size="sm" onClick={() => setEditing(true)}>
                 變更
               </Button>

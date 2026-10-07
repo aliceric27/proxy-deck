@@ -2,6 +2,7 @@
 // generated from the Rust structs into ./bindings by `cargo test` (ts-rs); never hand-edit them.
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { AccountCheck } from "./bindings/AccountCheck";
 import type { ClashProxy } from "./bindings/ClashProxy";
 import type { CoreStatus } from "./bindings/CoreStatus";
 import type { LogBatch } from "./bindings/LogBatch";
@@ -16,12 +17,14 @@ import type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
 import type { Snapshot } from "./bindings/Snapshot";
 import type { Traffic } from "./bindings/Traffic";
 
+export type { AccountCheck } from "./bindings/AccountCheck";
 export type { ClashProxy } from "./bindings/ClashProxy";
 export type { Connection } from "./bindings/Connection";
 export type { CoreStatus } from "./bindings/CoreStatus";
 export type { GeoIpGroup } from "./bindings/GeoIpGroup";
 export type { LogBatch } from "./bindings/LogBatch";
 export type { LogLevel } from "./bindings/LogLevel";
+export type { MatchMode } from "./bindings/MatchMode";
 export type { Mode } from "./bindings/Mode";
 export type { NodeEntry } from "./bindings/NodeEntry";
 export type { ProcessInfo } from "./bindings/ProcessInfo";
@@ -47,6 +50,8 @@ export const api = {
   saveProfile: (profile: Profile) => invoke<ProfileState>("save_profile", { profile }),
   setCredentials: (username: string, password: string) => invoke<void>("set_credentials", { username, password }),
   clearCredentials: () => invoke<void>("clear_credentials"),
+  /** Auth-only check of the stored Mudfish account against live nodes; costs no traffic. */
+  verifyAccount: () => invoke<AccountCheck>("verify_account"),
   nodes: (force: boolean) => invoke<NodeList>("get_nodes", { force }),
   warpCreate: () => invoke<ProxyNode>("warp_create"),
   /** Unregisters a just-created WARP device whose node could not be saved. */

@@ -119,6 +119,27 @@ pub async fn clear_credentials() -> CmdResult<()> {
     credentials::clear()
 }
 
+/// Tests whether the stored Mudfish account can authenticate against live nodes. Auth only, so it
+/// costs no traffic; it cannot tell a wrong password from an account out of credit (Mudfish rejects
+/// both the same way).
+#[tauri::command]
+pub async fn verify_account(state: State<'_, AppState>) -> CmdResult<crate::mudfish_probe::AccountCheck> {
+    let creds = credentials::load().ok_or("尚未設定 Mudfish 帳號")?;
+    // The cached list is enough (no network round trip); only an empty cache fetches one.
+    let mut ips: Vec<String> = crate::store::load_or_default::<crate::nodes::NodeCache>(&state.paths.node_cache_file())
+        .nodes
+        .into_iter()
+        .map(|n| n.ip)
+        .collect();
+    if ips.is_empty() {
+        ips = nodes::get(&state.paths, &state.http, false).await?.nodes.into_iter().map(|n| n.ip).collect();
+    }
+    if ips.is_empty() {
+        return Err("沒有可用的節點可供測試".into());
+    }
+    Ok(crate::mudfish_probe::check_account(&creds, &ips).await)
+}
+
 #[tauri::command]
 pub async fn get_nodes(state: State<'_, AppState>, force: bool) -> CmdResult<NodeList> {
     nodes::get(&state.paths, &state.http, force).await.map(NodeList::from)

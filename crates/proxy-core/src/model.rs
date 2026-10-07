@@ -187,8 +187,22 @@ pub enum UdpPolicy {
     Reject,
 }
 
-/// A routing group: traffic matching *any* of its matchers (apps, domains, rule sets,
-/// IP ranges) goes to the group's outbound. Groups are tried in priority order.
+/// How a group combines its matcher kinds: match any kind (OR) or every populated kind (AND).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum MatchMode {
+    /// Match when any matcher kind matches (the original behaviour).
+    #[default]
+    Any,
+    /// Match only when every populated matcher kind matches.
+    All,
+}
+
+/// A routing group: traffic matching its matchers (apps, domains, rule sets, IP ranges) goes
+/// to the group's outbound. `match_mode` says whether any one matcher kind is enough or every
+/// populated kind must match; the values within one kind always OR. Groups are tried in
+/// priority order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[ts(export)]
 pub struct RuleGroup {
@@ -222,6 +236,10 @@ pub struct RuleGroup {
     /// ignores it.
     #[serde(default)]
     pub udp: UdpPolicy,
+    /// Combine the matcher kinds with OR (any) or AND (all). Defaults to `Any`, so existing
+    /// profiles and migrated groups keep their behaviour; changing it needs a reconnect.
+    #[serde(default)]
+    pub match_mode: MatchMode,
     /// v2 `target`, read only to migrate it into `outbound`.
     #[serde(rename = "target", default, skip_serializing)]
     #[ts(skip)]
@@ -243,6 +261,7 @@ impl RuleGroup {
             rule_sets: Vec::new(),
             ip_cidrs: Vec::new(),
             udp: UdpPolicy::Follow,
+            match_mode: MatchMode::default(),
             legacy_target: None,
         }
     }
@@ -840,6 +859,23 @@ mod tests {
     fn log_level_defaults_to_warn_for_old_profiles() {
         let p: Profile = serde_json::from_str("{}").unwrap();
         assert_eq!(p.log_level, LogLevel::Warn);
+    }
+
+    /// A group saved before match modes existed keeps matching with OR, and no schema bump is needed.
+    #[test]
+    fn match_mode_defaults_to_any_for_old_groups_and_is_snake_case() {
+        let old = r#"{"schema_version": 3, "groups": [
+          {"id": "a", "name": "a", "enabled": true, "outbound": "auto", "process_names": ["a.exe"], "ip_cidrs": ["1.2.3.0/24"]}]}"#;
+        let mut p: Profile = serde_json::from_str(old).unwrap();
+        assert!(!p.migrate(), "a current-schema file needs no conversion for the new field");
+        assert_eq!(p.groups[0].match_mode, MatchMode::Any);
+        assert_eq!(RuleGroup::new("n", "n", TAG_AUTO).match_mode, MatchMode::Any);
+
+        p.groups[0].match_mode = MatchMode::All;
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["groups"][0]["match_mode"], "all");
+        assert_eq!(serde_json::from_value::<Profile>(json).unwrap(), p, "AND survives a save and load");
+        assert_eq!(serde_json::to_value(MatchMode::Any).unwrap(), "any");
     }
 
     #[test]

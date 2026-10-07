@@ -364,9 +364,21 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
           </Field>
         )}
 
-        <div className="space-y-1.5">
+        <div className="space-y-2">
           <div className="text-xs font-medium">比對條件</div>
-          <p className="text-[11px] text-muted">符合下列任一條件即套用這個群組。</p>
+          <Segmented
+            value={g.match_mode}
+            onChange={(match_mode: "any" | "all") => onChange({ match_mode })}
+            options={[
+              { value: "any", label: "符合任一條件 (OR)", hint: "任一類條件符合就套用" },
+              { value: "all", label: "符合全部條件 (AND)", hint: "每一類條件都要符合才套用，例如某程式且某 IP" },
+            ]}
+          />
+          <p className="text-[11px] leading-relaxed text-muted">
+            {g.match_mode === "all"
+              ? "需同時符合下列所有已設定的條件才套用（例如：特定程式 ＋ 特定 IP）。同一類中有多個值時仍是任一符合。若含網域條件，網域不使用 FakeIP，改以連線的 SNI／主機名稱比對（適用多數 TLS／HTTP 連線）。"
+              : "符合下列任一條件即套用這個群組。"}
+          </p>
         </div>
 
         <Section kind="app" count={counts.app} defaultOpen={fresh || counts.app > 0}>
