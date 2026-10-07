@@ -3,4 +3,9 @@ import type { CoreStatus } from "./CoreStatus";
 import type { Profile } from "./Profile";
 import type { ProfileState } from "./ProfileState";
 
-export type Snapshot = { profile: Profile, state: ProfileState, username: string | null, core: CoreStatus, elevated: boolean, version: string, sing_box_found: boolean, };
+export type Snapshot = { profile: Profile, state: ProfileState, username: string | null, core: CoreStatus, elevated: boolean, version: string, sing_box_found: boolean, 
+/**
+ * A problem found while loading the profile at startup (the file was unreadable, so the
+ * defaults are in use); shown as a warning for the whole session.
+ */
+notice: string | null, };

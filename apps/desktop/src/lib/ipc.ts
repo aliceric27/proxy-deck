@@ -19,6 +19,7 @@ import type { Traffic } from "./bindings/Traffic";
 export type { ClashProxy } from "./bindings/ClashProxy";
 export type { Connection } from "./bindings/Connection";
 export type { CoreStatus } from "./bindings/CoreStatus";
+export type { GeoIpGroup } from "./bindings/GeoIpGroup";
 export type { LogBatch } from "./bindings/LogBatch";
 export type { LogLevel } from "./bindings/LogLevel";
 export type { Mode } from "./bindings/Mode";
@@ -30,12 +31,15 @@ export type { ProxyNode } from "./bindings/ProxyNode";
 export type { RuleGroup } from "./bindings/RuleGroup";
 export type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
 export type { Snapshot } from "./bindings/Snapshot";
-export type { Target } from "./bindings/Target";
 export type { Traffic } from "./bindings/Traffic";
 export type { UdpPolicy } from "./bindings/UdpPolicy";
 
 /** Mirrors `RuleGroup::selector_tag` in proxy-core. */
 export const groupSelectorTag = (g: RuleGroup) => `group-${g.id}`;
+/** Selector tags of the GeoIP group, the final group and Global mode; mirror `TAG_GEOIP`, `TAG_FINAL`, `TAG_GLOBAL`. */
+export const TAG_GEOIP = "geoip";
+export const TAG_FINAL = "final";
+export const TAG_GLOBAL = "global";
 
 export const api = {
   snapshot: () => invoke<Snapshot>("get_snapshot"),

@@ -43,6 +43,9 @@ pub struct Snapshot {
     elevated: bool,
     version: String,
     sing_box_found: bool,
+    /// A problem found while loading the profile at startup (the file was unreadable, so the
+    /// defaults are in use); shown as a warning for the whole session.
+    notice: Option<String>,
 }
 
 #[tauri::command]
@@ -56,12 +59,13 @@ pub async fn get_snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
         elevated: system::is_elevated(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         sing_box_found: state.paths.sing_box.is_file(),
+        notice: state.notice.clone(),
     })
 }
 
 /// The single write path for the profile. Persists it, applies live-switchable choices
-/// (default node, group outbounds, mode) to a running core, and reports what still needs a
-/// reconnect.
+/// (what each selector — Global, final, GeoIP, every group — points at, and the mode) to a
+/// running core, and reports what still needs a reconnect.
 #[tauri::command]
 pub async fn save_profile(state: State<'_, AppState>, profile: Profile) -> CmdResult<ProfileState> {
     let removed_warp: Vec<String> = {

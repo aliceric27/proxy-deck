@@ -1,8 +1,14 @@
 # ProxyDesk
 
-Windows 桌面代理客戶端：從 Mudfish 取得 SOCKS5 節點，用 sing-box 的 TUN 模式讓**指定的應用程式或網域**走代理，其他流量直連。
+Windows 桌面代理客戶端：從 Mudfish 取得 SOCKS5 節點，用 sing-box 的 TUN 模式讓**指定的應用程式或網域**走代理，其餘流量依 GeoIP 與 final 處理（預設直連）。
 
-分流以「群組」為單位：一個群組可以同時包含程式、網域、規則集與 IP 範圍，各自指定出口節點，並依優先順序比對。
+分流由上而下比對：自訂群組 → GeoIP → final。
+
+- **自訂群組**：一個群組可以同時包含程式、網域、規則集與 IP 範圍，各自指定出口（直接連線、阻擋、自動選擇或某個節點），並依優先順序比對。
+- **GeoIP**：目的地 IP 屬於所選國家或地區（預設台灣）的流量，套用一個出口。
+- **final**：以上都不符合的流量，套用一個出口（預設直接連線）。
+
+GeoIP 與 final 是固定的群組，不能刪除或停用。它們在直接連線與節點之間切換時立即完整生效，不必重新連線；自訂群組在節點之間也是即時切換，但在直接連線與代理之間互換時，網域解析、QUIC 與 UDP 的部分規則要重新連線才會完整生效。改成或離開「阻擋」一律需要重新連線。全域模式另有自己的出口。
 
 - 介面：Tauri v2（Rust）+ React + Tailwind，桌面優先的佈局
 - 核心：未修改的 sing-box 1.14.2，以獨立子程序執行（GPL-3.0，不連結）
@@ -39,7 +45,7 @@ M0 驗證環境：`docker/m0/`（Linux 容器，見該目錄 README）與 `docs/
 ```
 crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、Profile → sing-box JSON（純邏輯，有單元測試）
 apps/desktop/src-tauri/   Tauri 後端：sing-box 子程序管理、Clash API client、認證管理員、系統匣
-apps/desktop/src/         React 前端：總覽、節點、分流規則、連線、日誌、設定
+apps/desktop/src/         React 前端：總覽、節點、分流群組、連線、日誌、設定
 docker/m0/                M0 Docker 驗證環境
 docs/                     PLAN.md 與 M0 驗證腳本
 ```
@@ -52,3 +58,13 @@ docs/                     PLAN.md 與 M0 驗證腳本
 | 設定（不含密碼）、節點清單快取 | `%APPDATA%\tw.proxydesk.desktop\` |
 | WARP 私鑰與裝置 token | Windows 認證管理員（`ProxyDesk` / `node-<tag>`） |
 | sing-box 工作目錄（cache.db），只有系統管理員能寫入。產生的設定（含帳密）經 stdin 傳給 sing-box，不寫入磁碟 | `%ProgramData%\ProxyDesk\run\` |
+
+升級設定檔格式時，原檔會先備份在同一個資料夾，檔名為 `profile.v<舊版本>-backup.json`（已存在就不覆蓋）。升級後流量維持原樣，只有兩處小差異：
+
+- 預設節點原本是「直接連線」時，全域模式會改成直連模式（同樣是所有流量直連）。
+- 原本跟隨「直接連線」預設節點的群組，現在是直連群組，所以它原先設定的 UDP 策略不再生效（直連群組沒有 UDP 與 QUIC 規則）。
+
+設定檔無法讀取（內容損壞，或被其他程式鎖住）時，有兩種結果：
+
+- 能把原檔改名移開：原檔改名為 `profile.json.bad`（已存在就依序用 `.bad-2`、`.bad-3`，不會覆蓋），程式改用預設設定，並在畫面上方提示。
+- 連改名都做不到（通常是檔案暫時被防毒軟體或其他程式占用）：ProxyDesk 會顯示錯誤並拒絕啟動，原檔完全不動，以免第一次儲存就把它蓋掉。關閉占用的程式後重新啟動即可。

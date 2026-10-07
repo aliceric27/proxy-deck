@@ -4,6 +4,8 @@ export type DnsSettings = {
 /**
  * Proxied domains resolve to fake IPs so the node resolves them remotely.
  * Required for remote resolution: sing-box hands SOCKS5 the IP otherwise (verified in M0).
+ * Only the domains of proxied custom groups get fake IPs: everything else resolves to its
+ * real IP, which GeoIP matches on.
  */
 fakeip: boolean, 
 /**

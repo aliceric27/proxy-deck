@@ -24,6 +24,9 @@ pub struct AppState {
     pub profile: RwLock<Profile>,
     pub core: Arc<CoreManager>,
     pub http: reqwest::Client,
+    /// Something the user should know from startup: the profile was unreadable and the defaults
+    /// replaced it. Set once, shown by the UI for as long as the app runs.
+    pub notice: Option<String>,
 }
 
 /// Forwards core notifications to the webview (`core-status`, batched `core-log`) and the tray.
@@ -99,10 +102,7 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
 /// Everything `setup` needs; any error is shown to the user by `fatal`.
 fn setup(app: &mut tauri::App) -> Result<(), String> {
     let paths = Paths::resolve(app.handle())?;
-    let mut profile: Profile = store::load_or_default(&paths.profile_file());
-    if profile.migrate() {
-        store::save(&paths.profile_file(), &profile)?;
-    }
+    let (profile, notice) = store::load_profile(&paths.profile_file())?;
     let launcher = Arc::new(SingBox { exe: paths.sing_box.clone(), run_dir: paths.run_dir.clone() });
     let core = CoreManager::new(launcher, Arc::new(TauriEvents(app.handle().clone())));
     tauri::async_runtime::spawn(core.log_task());
@@ -113,7 +113,7 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
-    app.manage(AppState { paths, profile: RwLock::new(profile), core, http });
+    app.manage(AppState { paths, profile: RwLock::new(profile), core, http, notice });
     create_main_window(app.handle()).map_err(|e| e.to_string())?;
     tray::create(app.handle()).map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn(traffic::run(app.handle().clone()));

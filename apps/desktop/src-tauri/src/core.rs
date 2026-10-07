@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use proxy_core::singbox::{self, GenerateOptions};
-use proxy_core::{Mode, Profile, Selections, TAG_PROXY};
+use proxy_core::{Mode, Profile, Selections};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use ts_rs::TS;
@@ -536,12 +536,19 @@ impl CoreManager {
     }
 }
 
-/// Drops switches the running config cannot take (selector or member added since it started);
-/// the fingerprint already marks those as needing a reconnect.
+/// Whether the running config has `selector` and it lists `outbound` as a member, i.e. whether
+/// the Clash API can switch it there.
+fn fits(plan: &StartPlan, selector: &str, outbound: &str) -> bool {
+    plan.selectors.get(selector).is_some_and(|members| members.contains(outbound))
+}
+
+/// Drops switches the running config cannot take (selector or member added since it started,
+/// or a selector that did not exist because its group was blocked); the fingerprint already
+/// marks those as needing a reconnect.
 fn applicable(plan: &StartPlan, ops: Vec<LiveOp>) -> Vec<LiveOp> {
     ops.into_iter()
         .filter(|op| match op {
-            LiveOp::Select { selector, outbound } => plan.selectors.get(selector).is_some_and(|m| m.contains(outbound)),
+            LiveOp::Select { selector, outbound } => fits(plan, selector, outbound),
             LiveOp::Mode(_) | LiveOp::CloseAll => true,
         })
         .collect()
@@ -550,22 +557,18 @@ fn applicable(plan: &StartPlan, ops: Vec<LiveOp>) -> Vec<LiveOp> {
 /// The part of `desired` the running config can hold; skipped choices are left out (unknown),
 /// so `live` only ever records what was really sent.
 fn applied_part(plan: &StartPlan, desired: &Selections) -> Selections {
-    let fits = |selector: &str, outbound: &str| plan.selectors.get(selector).is_some_and(|m| m.contains(outbound));
     Selections {
         mode: desired.mode,
-        default_node: if fits(TAG_PROXY, &desired.default_node) { desired.default_node.clone() } else { String::new() },
-        groups: desired.groups.iter().filter(|(s, o)| fits(s, o)).map(|(s, o)| (s.clone(), o.clone())).collect(),
+        selectors: desired.selectors.iter().filter(|(s, o)| fits(plan, s, o)).map(|(s, o)| (s.clone(), o.clone())).collect(),
     }
 }
 
-/// Clash API calls that turn `from` (unknown → everything) into `to`.
+/// Clash API calls that turn `from` (unknown → everything) into `to`, one per selector whose
+/// choice differs.
 fn diff(from: Option<&Selections>, to: &Selections) -> Vec<LiveOp> {
     let mut ops = Vec::new();
-    if from.map(|f| &f.default_node) != Some(&to.default_node) {
-        ops.push(LiveOp::Select { selector: TAG_PROXY.to_string(), outbound: to.default_node.clone() });
-    }
-    for (selector, outbound) in &to.groups {
-        if from.and_then(|f| f.groups.get(selector)) != Some(outbound) {
+    for (selector, outbound) in &to.selectors {
+        if from.and_then(|f| f.selectors.get(selector)) != Some(outbound) {
             ops.push(LiveOp::Select { selector: selector.clone(), outbound: outbound.clone() });
         }
     }
@@ -886,6 +889,7 @@ mod tests {
         fn logs(&self, _: &LogBatch) {}
     }
 
+    /// A config with Global mode, `final` and one group `a`.
     fn plan(fp: &str) -> StartPlan {
         let members = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
         StartPlan {
@@ -893,14 +897,19 @@ mod tests {
             clash: ClashClient::new("127.0.0.1:9", "s"),
             fingerprint: fp.into(),
             selectors: BTreeMap::from([
-                ("proxy".to_string(), members(&["auto", "direct", "mudfish-1", "mudfish-2"])),
-                ("group-a".to_string(), members(&["proxy", "auto", "mudfish-1", "mudfish-2"])),
+                ("final".to_string(), members(&["direct", "auto", "mudfish-1", "mudfish-2"])),
+                ("global".to_string(), members(&["auto", "mudfish-1", "mudfish-2"])),
+                ("group-a".to_string(), members(&["direct", "auto", "mudfish-1", "mudfish-2"])),
             ]),
         }
     }
 
+    /// `final` on `node`, group `a` direct, Global mode on `auto`.
     fn sel(node: &str) -> Selections {
-        Selections { mode: Mode::Rule, default_node: node.into(), groups: BTreeMap::from([("group-a".into(), "proxy".into())]) }
+        Selections {
+            mode: Mode::Rule,
+            selectors: BTreeMap::from([("final".into(), node.into()), ("global".into(), "auto".into()), ("group-a".into(), "direct".into())]),
+        }
     }
 
     fn setup() -> (Arc<CoreManager>, Arc<Fake>, Arc<Recorder>) {
@@ -921,7 +930,9 @@ mod tests {
         m.start(plan("fp1"), sel("auto")).await.unwrap();
         assert!(matches!(m.status().await, CoreStatus::Running { .. }));
         let applied = fake.applied.lock().unwrap().clone();
-        assert_eq!(applied[0], LiveOp::Select { selector: "proxy".into(), outbound: "auto".into() });
+        assert_eq!(applied[0], LiveOp::Select { selector: "final".into(), outbound: "auto".into() });
+        assert!(applied.contains(&LiveOp::Select { selector: "global".into(), outbound: "auto".into() }));
+        assert!(applied.contains(&LiveOp::Select { selector: "group-a".into(), outbound: "direct".into() }));
         assert!(applied.contains(&LiveOp::Mode(Mode::Rule)));
         assert!(!applied.contains(&LiveOp::CloseAll), "no connections to close on a fresh start");
         assert!(!m.is_stale(Some("fp1")).await);
@@ -931,7 +942,7 @@ mod tests {
         // live change: only the difference, no CloseAll for selectors
         fake.applied.lock().unwrap().clear();
         m.set_selections(sel("direct")).await.unwrap();
-        assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "proxy".into(), outbound: "direct".into() }]);
+        assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "final".into(), outbound: "direct".into() }]);
         let mut global = sel("direct");
         global.mode = Mode::Global;
         fake.applied.lock().unwrap().clear();
@@ -950,7 +961,7 @@ mod tests {
         m.set_selections(sel("mudfish-1")).await.unwrap();
         assert!(fake.applied.lock().unwrap().is_empty());
         m.start(plan("fp"), sel("mudfish-2")).await.unwrap();
-        assert!(fake.applied.lock().unwrap().contains(&LiveOp::Select { selector: "proxy".into(), outbound: "mudfish-2".into() }));
+        assert!(fake.applied.lock().unwrap().contains(&LiveOp::Select { selector: "final".into(), outbound: "mudfish-2".into() }));
     }
 
     #[tokio::test]
@@ -971,8 +982,8 @@ mod tests {
         m.start(plan("fp"), sel("auto")).await.unwrap();
         fake.applied.lock().unwrap().clear();
         let mut s = sel("mudfish-3"); // node added after the start
-        s.groups.insert("group-new".into(), "proxy".into()); // group added after the start
-        s.groups.insert("group-a".into(), "auto".into());
+        s.selectors.insert("group-new".into(), "direct".into()); // group added after the start
+        s.selectors.insert("group-a".into(), "auto".into());
         m.set_selections(s).await.unwrap();
         assert_eq!(*fake.applied.lock().unwrap(), vec![LiveOp::Select { selector: "group-a".into(), outbound: "auto".into() }]);
         assert!(!m.is_stale(Some("fp")).await, "skipped switches are not failures");
@@ -1107,7 +1118,31 @@ mod tests {
     #[test]
     fn diff_from_unknown_sets_everything() {
         let ops = diff(None, &sel("auto"));
-        assert_eq!(ops.len(), 3);
+        assert_eq!(ops.len(), 4, "three selectors and the mode");
         assert!(diff(Some(&sel("auto")), &sel("auto")).is_empty());
+    }
+
+    #[test]
+    fn diff_compares_selector_by_selector() {
+        let mut to = sel("auto");
+        to.selectors.insert("group-a".into(), "mudfish-1".into());
+        to.selectors.insert("global".into(), "mudfish-2".into());
+        assert_eq!(
+            diff(Some(&sel("auto")), &to),
+            vec![
+                LiveOp::Select { selector: "global".into(), outbound: "mudfish-2".into() },
+                LiveOp::Select { selector: "group-a".into(), outbound: "mudfish-1".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn live_state_only_records_what_the_config_can_hold() {
+        let mut s = sel("mudfish-3"); // a node the config does not know
+        s.selectors.insert("group-new".into(), "auto".into()); // a selector it does not have
+        let held = applied_part(&plan("fp"), &s);
+        assert_eq!(held.selectors, BTreeMap::from([("global".to_string(), "auto".to_string()), ("group-a".to_string(), "direct".to_string())]));
+        // so a later switch to a node the config does have is still sent
+        assert_eq!(diff(Some(&held), &sel("mudfish-1")), vec![LiveOp::Select { selector: "final".into(), outbound: "mudfish-1".into() }]);
     }
 }

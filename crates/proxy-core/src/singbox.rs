@@ -72,15 +72,16 @@ pub fn generate(profile: &Profile, opts: &GenerateOptions) -> Result<Value, Gene
     if let Some(g) = groups.iter().find(|g| g.is_empty()) {
         return Err(GenerateError::EmptyGroup(g.name.clone()));
     }
-    let rule_sets = collect_rule_sets(&groups, opts.ruleset_dir)?;
+    let geoip = geoip_rule_sets(profile);
+    let rule_sets = collect_rule_sets(&groups, &geoip, opts.ruleset_dir)?;
 
     Ok(json!({
         "log": { "level": profile.log_level.as_str(), "timestamp": true },
         "dns": dns(profile, &groups),
         "inbounds": [tun(&profile.tun)],
-        "outbounds": outbounds(profile, &groups, opts),
+        "outbounds": outbounds(profile, opts),
         "endpoints": endpoints(profile, opts),
-        "route": route(profile, &groups, rule_sets, opts.self_exe),
+        "route": route(profile, &groups, &geoip, rule_sets, opts.self_exe),
         "experimental": {
             "clash_api": {
                 "external_controller": opts.clash_listen,
@@ -93,8 +94,8 @@ pub fn generate(profile: &Profile, opts: &GenerateOptions) -> Result<Value, Gene
 }
 
 /// Everything in the generated config that only takes effect when the core restarts. Two
-/// profiles with the same fingerprint differ at most in their `Selections` (default node,
-/// group outbounds, mode), which the running core applies live through the Clash API.
+/// profiles with the same fingerprint differ at most in their `Selections` (what each selector
+/// is switched to, and the mode), which the running core applies live through the Clash API.
 /// `Err` carries why the profile cannot become a config at all.
 pub fn restart_fingerprint(profile: &Profile, ruleset_dir: &Path) -> Result<String, String> {
     let keys: BTreeMap<String, String> =
@@ -163,12 +164,15 @@ impl RuleSetRef {
     }
 }
 
-fn collect_rule_sets(groups: &[&RuleGroup], dir: &Path) -> Result<BTreeSet<RuleSetRef>, GenerateError> {
+/// The GeoIP group's countries as rule-set codes (`tw` → `geoip:tw`); empty means no GeoIP rule.
+fn geoip_rule_sets(profile: &Profile) -> Vec<String> {
+    profile.geoip.codes().into_iter().map(|c| format!("geoip:{c}")).collect()
+}
+
+fn collect_rule_sets(groups: &[&RuleGroup], geoip: &[String], dir: &Path) -> Result<BTreeSet<RuleSetRef>, GenerateError> {
     let mut set = BTreeSet::new();
-    for g in groups {
-        for c in g.rule_sets.iter().filter(|c| !c.trim().is_empty()) {
-            set.insert(RuleSetRef::parse(c.trim(), dir)?);
-        }
+    for c in groups.iter().flat_map(|g| &g.rule_sets).chain(geoip).filter(|c| !c.trim().is_empty()) {
+        set.insert(RuleSetRef::parse(c.trim(), dir)?);
     }
     Ok(set)
 }
@@ -236,7 +240,7 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
         json!({
             "type": "https", "tag": DNS_REMOTE,
             "server": "1.1.1.1", "server_port": 443, "path": "/dns-query",
-            "detour": TAG_PROXY,
+            "detour": TAG_AUTO,
         }),
     ];
     if fake {
@@ -251,7 +255,7 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
     if fake {
         dns_rules.push(json!({ "clash_mode": "Global", "query_type": ["A", "AAAA"], "action": "route", "server": DNS_FAKEIP }));
     }
-    for g in groups.iter().filter(|g| g.target == Target::Proxy) {
+    for g in groups.iter().filter(|g| profile.is_proxied(&g.outbound)) {
         if let Some(mut m) = domain_rule(g) {
             m.insert("query_type".into(), json!(["A", "AAAA"]));
             m.insert("action".into(), json!("route"));
@@ -271,6 +275,8 @@ fn dns(profile: &Profile, groups: &[&RuleGroup]) -> Value {
     // started in Global or Direct mode could never be switched to Rule live.
     dns_rules.push(json!({ "clash_mode": "Rule", "action": "route", "server": DNS_LOCAL }));
 
+    // `final` must stay real DNS: only the domains of proxied groups are faked, and GeoIP
+    // needs the real IP of every other domain to match on.
     let mut dns = json!({ "servers": servers, "rules": dns_rules, "final": DNS_LOCAL });
     if profile.dns.ipv4_only {
         dns["strategy"] = json!("ipv4_only");
@@ -288,41 +294,33 @@ fn tun(t: &TunSettings) -> Value {
     })
 }
 
-fn outbounds(profile: &Profile, groups: &[&RuleGroup], opts: &GenerateOptions) -> Value {
+fn outbounds(profile: &Profile, opts: &GenerateOptions) -> Value {
     let node_tags: Vec<&str> = profile.nodes.iter().map(|n| n.tag.as_str()).collect();
-    // The default node may also be `direct`: groups that use it, Global mode and proxied
-    // other traffic then go out directly without editing each group.
-    let mut main_members = vec![TAG_AUTO, TAG_DIRECT];
-    main_members.extend(&node_tags);
     // WARP lands on a nearby Cloudflare edge, so its latency nearly always wins; letting
     // `auto` pick it would silently pull region-targeted traffic off Mudfish. WARP joins
     // `auto` only when there are no Mudfish nodes, and is otherwise chosen explicitly.
     let mudfish: Vec<&str> = profile.nodes.iter().filter(|n| !n.is_wireguard()).map(|n| n.tag.as_str()).collect();
     let auto_members = if mudfish.is_empty() { node_tags.clone() } else { mudfish };
 
-    let mut out = vec![
-        json!({
-            "type": "selector", "tag": TAG_PROXY,
-            "outbounds": main_members,
-            "default": profile.effective_selected(),
-            "interrupt_exist_connections": true,
-        }),
-        json!({
-            "type": "urltest", "tag": TAG_AUTO,
-            "outbounds": auto_members,
-            "url": "https://www.gstatic.com/generate_204",
-            "interval": "5m", "tolerance": 50, "idle_timeout": "30m",
-        }),
-    ];
+    let mut out = vec![json!({
+        "type": "urltest", "tag": TAG_AUTO,
+        "outbounds": auto_members,
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "5m", "tolerance": 50, "idle_timeout": "30m",
+    })];
 
-    // Each proxied group has its own selector, so its node can be switched live.
-    let mut group_members = vec![TAG_PROXY, TAG_AUTO];
-    group_members.extend(&node_tags);
-    for g in groups.iter().filter(|g| g.target == Target::Proxy) {
+    // One selector per entry of `Profile::selections` — the very list the running core is
+    // switched by, so config and live switches cannot drift apart: Global mode, `final`,
+    // GeoIP and every group that is not blocked. Each can switch between direct and any node
+    // live; Global has no `direct` (Direct mode covers it). `reject` is never a member: it
+    // only exists as a rule action.
+    for (tag, choice) in profile.selections().selectors {
+        let mut members = if tag == TAG_GLOBAL { vec![TAG_AUTO] } else { vec![TAG_DIRECT, TAG_AUTO] };
+        members.extend(&node_tags);
         out.push(json!({
-            "type": "selector", "tag": g.selector_tag(),
-            "outbounds": group_members,
-            "default": profile.effective_group_outbound(g),
+            "type": "selector", "tag": tag,
+            "outbounds": members,
+            "default": choice,
             "interrupt_exist_connections": true,
         }));
     }
@@ -377,7 +375,9 @@ fn endpoints(profile: &Profile, opts: &GenerateOptions) -> Value {
     Value::Array(eps)
 }
 
-fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRef>, self_exe: Option<&str>) -> Value {
+/// Route order: sniff, hijack-dns, exceptions, mode switches, the custom groups, GeoIP, and
+/// `route.final` (the `final` group) at the very end.
+fn route(profile: &Profile, groups: &[&RuleGroup], geoip: &[String], rule_sets: BTreeSet<RuleSetRef>, self_exe: Option<&str>) -> Value {
     let mut out = vec![
         json!({ "action": "sniff", "sniffer": ["http", "tls", "quic", "dns", "stun"], "timeout": "300ms" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
@@ -390,35 +390,36 @@ fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRe
         out.push(json!({ "ip_is_private": true, "action": "route", "outbound": TAG_DIRECT }));
     }
     out.push(json!({ "clash_mode": "Direct", "action": "route", "outbound": TAG_DIRECT }));
-    out.push(json!({ "clash_mode": "Global", "action": "route", "outbound": TAG_PROXY }));
+    out.push(json!({ "clash_mode": "Global", "action": "route", "outbound": TAG_GLOBAL }));
 
     for g in groups {
-        if profile.dns.block_quic_for_proxied {
+        let proxied = profile.is_proxied(&g.outbound);
+        if proxied && g.udp == UdpPolicy::Follow && profile.dns.block_quic_for_proxied {
             out.extend(quic_block(g));
         }
         let matcher = any_of(group_matchers(g));
-        if g.target == Target::Proxy && g.udp != UdpPolicy::Follow {
+        if proxied && g.udp != UdpPolicy::Follow {
             let mut udp_rule = json!({ "type": "logical", "mode": "and", "rules": [{ "network": ["udp"] }, matcher.clone()] });
             with_action(&mut udp_rule, if g.udp == UdpPolicy::Direct { Action::Direct } else { Action::Reject });
             out.push(udp_rule);
         }
         let mut rule = matcher;
-        with_action(
-            &mut rule,
-            match g.target {
-                Target::Proxy => Action::Route(g.selector_tag()),
-                Target::Direct => Action::Direct,
-                Target::Reject => Action::Reject,
-            },
-        );
+        with_action(&mut rule, selector_action(profile, &g.outbound, &g.selector_tag()));
         out.push(rule);
     }
 
-    let final_outbound = match profile.final_target {
-        Target::Proxy => TAG_PROXY,
-        Target::Direct | Target::Reject => TAG_DIRECT,
-    };
-    if profile.final_target == Target::Reject {
+    // GeoIP matches the destination IP only (no `resolve`): the default DNS is real, so every
+    // domain no group claimed already arrives here as the IP it resolved to.
+    if !geoip.is_empty() {
+        let mut rule = json!({ "rule_set": rule_set_tags(geoip, false) });
+        with_action(&mut rule, selector_action(profile, &profile.geoip.outbound, TAG_GEOIP));
+        out.push(rule);
+    }
+
+    // A blocked `final` has no selector to point `route.final` at (`reject` is no outbound):
+    // a catch-all reject rule does the blocking, and `final` is never reached.
+    let final_blocked = profile.effective_outbound(&profile.final_outbound) == TAG_REJECT;
+    if final_blocked {
         out.push(json!({ "network": ["tcp", "udp"], "action": "reject" }));
     }
 
@@ -430,21 +431,29 @@ fn route(profile: &Profile, groups: &[&RuleGroup], rule_sets: BTreeSet<RuleSetRe
     json!({
         "rules": out,
         "rule_set": sets,
-        "final": final_outbound,
+        "final": if final_blocked { TAG_DIRECT } else { TAG_FINAL },
         "auto_detect_interface": true,
         "default_domain_resolver": DNS_LOCAL,
     })
 }
 
+/// What a group, GeoIP or `final` rule does with its traffic: route it through the group's
+/// `selector`, or reject it when the group's outbound is `reject`.
+fn selector_action(profile: &Profile, outbound: &str, selector: &str) -> Action {
+    if profile.effective_outbound(outbound) == TAG_REJECT {
+        Action::Reject
+    } else {
+        Action::Route(selector.to_string())
+    }
+}
+
 /// Rejects UDP 443 to a proxied group's domains, so browsers retry over TCP through the
 /// proxy. Emitted right before the group's own rule, so a higher-priority group that sends the
 /// same domain direct still wins. Domains and rule sets are separate sub-rules because
-/// `rule_set` is ANDed with the domain fields inside a single rule. Groups with their own UDP
-/// policy keep it (UDP direct lets QUIC work directly; UDP reject already covers it).
+/// `rule_set` is ANDed with the domain fields inside a single rule. The caller emits it only
+/// for proxied groups whose UDP follows the group: with their own UDP policy they keep it
+/// (UDP direct lets QUIC work directly; UDP reject already covers it).
 fn quic_block(g: &RuleGroup) -> Option<Value> {
-    if g.target != Target::Proxy || g.udp != UdpPolicy::Follow {
-        return None;
-    }
     let mut subs = Vec::new();
     if let Some(d) = domain_rule(g) {
         subs.push(Value::Object(d));
@@ -572,33 +581,30 @@ mod tests {
         }
     }
 
-    /// ads (reject) → game (mixed: app + domain + dir, own node, UDP direct) → site (domain only)
-    /// → games (rule sets) → lan (IP, direct)
+    /// ads (blocked) → game (mixed: app + domain + dir, own node, UDP direct) → site (domain only)
+    /// → games (rule sets) → lan (IP, direct); then GeoIP and final, both `direct` (the defaults).
     fn sample_profile() -> Profile {
-        let mut ads = RuleGroup::new("ads", "ads", Target::Reject);
+        let mut ads = RuleGroup::new("ads", "ads", TAG_REJECT);
         ads.rule_sets = vec!["geosite:category-ads-all".into()];
 
-        let mut game = RuleGroup::new("game", "game", Target::Proxy);
-        game.outbound = "mudfish-655".into();
+        let mut game = RuleGroup::new("game", "game", "mudfish-655");
         game.process_names = vec!["Game.exe".into()];
         game.process_paths = vec![r"C:\Program Files\Game\Game.exe".into()];
         game.directories = vec![r"C:\Riot Games\".into()];
         game.domain_suffixes = vec!["riotgames.com".into()];
         game.udp = UdpPolicy::Direct;
 
-        let mut site = RuleGroup::new("site", "site", Target::Proxy);
+        let mut site = RuleGroup::new("site", "site", "mudfish-591");
         site.domain_suffixes = vec!["ifconfig.me".into()];
 
-        let mut games = RuleGroup::new("games", "games", Target::Proxy);
-        games.outbound = TAG_AUTO.into();
+        let mut games = RuleGroup::new("games", "games", TAG_AUTO);
         games.rule_sets = vec!["geosite:category-games".into(), "geoip:jp".into()];
 
-        let mut lan = RuleGroup::new("lan", "lan", Target::Direct);
+        let mut lan = RuleGroup::new("lan", "lan", TAG_DIRECT);
         lan.ip_cidrs = vec!["100.64.0.0/10".into()];
 
         Profile {
             nodes: vec![node(591), node(655)],
-            selected: "mudfish-591".into(),
             groups: vec![ads, game, site, games, lan],
             ..Profile::default()
         }
@@ -612,6 +618,10 @@ mod tests {
         c["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == tag).unwrap()
     }
 
+    fn has_outbound(c: &Value, tag: &str) -> bool {
+        c["outbounds"].as_array().unwrap().iter().any(|o| o["tag"] == tag)
+    }
+
     #[test]
     fn rejects_profiles_that_cannot_run() {
         let dir = ruleset_dir();
@@ -622,12 +632,12 @@ mod tests {
         o.password = "";
         assert_eq!(generate(&p, &o), Err(GenerateError::NoCredentials));
 
-        p.groups.push(RuleGroup::new("empty", "empty", Target::Proxy));
+        p.groups.push(RuleGroup::new("empty", "empty", TAG_AUTO));
         assert_eq!(generate(&p, &opts(&dir)), Err(GenerateError::EmptyGroup("empty".into())));
         p.groups.last_mut().unwrap().enabled = false;
         assert!(generate(&p, &opts(&dir)).is_ok(), "disabled empty groups are ignored");
 
-        let mut bad = RuleGroup::new("bad", "bad", Target::Proxy);
+        let mut bad = RuleGroup::new("bad", "bad", TAG_AUTO);
         bad.rule_sets = vec!["geosite:../x".into()];
         p.groups.push(bad);
         assert_eq!(generate(&p, &opts(&dir)), Err(GenerateError::BadRuleSetCode("geosite:../x".into())));
@@ -637,21 +647,77 @@ mod tests {
     }
 
     #[test]
-    fn proxied_groups_get_their_own_selector() {
-        let c = generate(&sample_profile(), &opts(&ruleset_dir())).unwrap();
-        let main = find_outbound(&c, "proxy");
-        assert_eq!(main["default"], "mudfish-591");
-        assert_eq!(main["outbounds"], json!(["auto", "direct", "mudfish-591", "mudfish-655"]));
+    fn geoip_countries_need_their_rule_sets() {
+        let dir = ruleset_dir();
+        let mut p = sample_profile();
+        p.geoip.countries = vec!["tw".into(), "../x".into()];
+        assert_eq!(generate(&p, &opts(&dir)), Err(GenerateError::BadRuleSetCode("geoip:../x".into())));
 
-        let game = find_outbound(&c, "group-game");
-        assert_eq!(game["type"], "selector");
-        assert_eq!(game["outbounds"], json!(["proxy", "auto", "mudfish-591", "mudfish-655"]));
-        assert_eq!(game["default"], "mudfish-655");
-        assert_eq!(find_outbound(&c, "group-site")["default"], "proxy");
+        p.geoip.countries = vec!["tw".into(), "no-such-country".into()];
+        assert_eq!(generate(&p, &opts(&dir)), Err(GenerateError::MissingRuleSet("geoip:no-such-country".into())));
+
+        p.geoip.countries = vec!["blocked@ru".into()];
+        let c = generate(&p, &opts(&dir)).unwrap();
+        assert!(rules(&c).iter().any(|r| r["rule_set"] == json!(["geoip-blocked-at-ru"])), "codes with @ become valid tags");
+
+        // a blocked GeoIP group still needs its sets
+        p.geoip = GeoIpGroup { countries: vec!["no-such-country".into()], outbound: TAG_REJECT.into() };
+        assert_eq!(generate(&p, &opts(&dir)), Err(GenerateError::MissingRuleSet("geoip:no-such-country".into())));
+    }
+
+    #[test]
+    fn every_selector_comes_from_the_selections() {
+        let p = sample_profile();
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+
+        // global, final, GeoIP and every enabled group that is not blocked (direct ones too)
+        let members = selector_members(&c);
+        let selections = p.selections();
+        assert_eq!(members.keys().collect::<Vec<_>>(), selections.selectors.keys().collect::<Vec<_>>());
+        assert_eq!(
+            members.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["final", "geoip", "global", "group-game", "group-games", "group-lan", "group-site"]
+        );
+        for (tag, choice) in &selections.selectors {
+            let s = find_outbound(&c, tag);
+            assert_eq!(s["type"], "selector");
+            assert_eq!(s["default"], choice.as_str(), "{tag}");
+            assert_eq!(s["interrupt_exist_connections"], true, "{tag}");
+        }
+
+        assert_eq!(find_outbound(&c, "global")["outbounds"], json!(["auto", "mudfish-591", "mudfish-655"]), "Global has no direct");
+        for tag in ["final", "geoip", "group-game", "group-games", "group-lan", "group-site"] {
+            assert_eq!(find_outbound(&c, tag)["outbounds"], json!(["direct", "auto", "mudfish-591", "mudfish-655"]), "{tag}");
+        }
+        assert_eq!(find_outbound(&c, "group-game")["default"], "mudfish-655");
+        assert_eq!(find_outbound(&c, "group-site")["default"], "mudfish-591");
         assert_eq!(find_outbound(&c, "group-games")["default"], "auto");
+        assert_eq!(find_outbound(&c, "group-lan")["default"], "direct");
+        assert_eq!(find_outbound(&c, "final")["default"], "direct");
+        assert_eq!(find_outbound(&c, "geoip")["default"], "direct");
+        assert_eq!(find_outbound(&c, "global")["default"], "auto");
+        assert_eq!(find_outbound(&c, "auto")["type"], "urltest");
+        assert!(!has_outbound(&c, "group-ads"), "a blocked group has no selector");
+        assert!(!has_outbound(&c, "proxy"), "the default-node selector is gone");
+    }
 
-        let tags: Vec<&str> = c["outbounds"].as_array().unwrap().iter().map(|o| o["tag"].as_str().unwrap()).collect();
-        assert!(!tags.contains(&"group-ads") && !tags.contains(&"group-lan"), "only proxied groups get selectors");
+    #[test]
+    fn reject_is_only_ever_a_rule_action() {
+        let mut p = sample_profile();
+        p.final_outbound = TAG_REJECT.into();
+        p.geoip.outbound = TAG_REJECT.into();
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+
+        for o in c["outbounds"].as_array().unwrap() {
+            assert_ne!(o["tag"], "reject");
+            assert!(o["outbounds"].as_array().into_iter().flatten().all(|m| m != "reject"), "{o}");
+        }
+        assert!(rules(&c).iter().all(|r| r["outbound"] != "reject"));
+        assert_ne!(c["route"]["final"], "reject");
+        for blocked in ["final", "geoip", "group-ads"] {
+            assert!(!has_outbound(&c, blocked), "{blocked} is blocked, so it needs no selector");
+        }
+        assert_eq!(rules(&c)[5], json!({ "rule_set": ["geosite-category-ads-all"], "action": "reject" }));
     }
 
     #[test]
@@ -661,7 +727,7 @@ mod tests {
         // sniff, hijack-dns, bypass LAN, then the two mode switches
         assert_eq!(r[2], json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
         assert_eq!(r[3]["clash_mode"], "Direct");
-        assert_eq!(r[4]["clash_mode"], "Global");
+        assert_eq!(r[4], json!({ "clash_mode": "Global", "action": "route", "outbound": "global" }));
 
         assert_eq!(r[5], json!({ "rule_set": ["geosite-category-ads-all"], "action": "reject" }));
 
@@ -692,14 +758,17 @@ mod tests {
         // games: only the geosite set takes part in QUIC blocking (geoip sets are IP lists)
         assert_eq!(r[10]["rules"][1], json!({ "rule_set": ["geosite-category-games"] }));
         assert_eq!(r[11], json!({ "rule_set": ["geosite-category-games", "geoip-jp"], "action": "route", "outbound": "group-games" }));
-        assert_eq!(r[12], json!({ "ip_cidr": ["100.64.0.0/10"], "action": "route", "outbound": "direct" }));
-        assert_eq!(r.len(), 13);
-        assert_eq!(c["route"]["final"], "direct");
-        assert_eq!(c["route"]["rule_set"].as_array().unwrap().len(), 3);
+        // a direct group is routed through its own selector too, so it can switch to a node live
+        assert_eq!(r[12], json!({ "ip_cidr": ["100.64.0.0/10"], "action": "route", "outbound": "group-lan" }));
+        // GeoIP right behind the groups; final is `route.final`, not a rule
+        assert_eq!(r[13], json!({ "rule_set": ["geoip-tw"], "action": "route", "outbound": "geoip" }));
+        assert_eq!(r.len(), 14);
+        assert_eq!(c["route"]["final"], "final");
+        assert_eq!(c["route"]["rule_set"].as_array().unwrap().len(), 4, "ads, games, geoip-jp and geoip-tw");
     }
 
-    /// Outbounds of the group rules in order (skips QUIC blocks and the fixed prefix).
-    fn group_outbounds(c: &Value) -> Vec<String> {
+    /// Outbounds of the rules in order (skips QUIC blocks and the fixed prefix).
+    fn rule_outbounds(c: &Value) -> Vec<String> {
         rules(c)[5..].iter().filter_map(|r| r["outbound"].as_str().map(String::from)).collect()
     }
 
@@ -708,15 +777,62 @@ mod tests {
         let mut p = sample_profile();
         p.groups.swap(2, 4); // lan before site
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        assert_eq!(group_outbounds(&c), ["direct", "group-game", "direct", "group-games", "group-site"]);
+        assert_eq!(rule_outbounds(&c), ["direct", "group-game", "group-lan", "group-games", "group-site", "geoip"]);
+    }
+
+    #[test]
+    fn geoip_follows_the_groups_and_precedes_the_final_catch_all() {
+        let dir = ruleset_dir();
+        let mut p = sample_profile();
+        p.geoip = GeoIpGroup { countries: vec!["tw".into(), "jp".into(), " tw".into()], outbound: "mudfish-591".into() };
+        let c = generate(&p, &opts(&dir)).unwrap();
+        let r = rules(&c);
+        let geoip = r.iter().position(|x| x["outbound"] == "geoip").unwrap();
+        assert_eq!(r[geoip - 1]["outbound"], "group-lan", "right behind the last group");
+        assert_eq!(r[geoip], json!({ "rule_set": ["geoip-tw", "geoip-jp"], "action": "route", "outbound": "geoip" }));
+        assert_eq!(r.len(), geoip + 1, "nothing follows while final is not blocked");
+        assert_eq!(find_outbound(&c, "geoip")["default"], "mudfish-591");
+        let tags: Vec<&str> = c["route"]["rule_set"].as_array().unwrap().iter().map(|s| s["tag"].as_str().unwrap()).collect();
+        assert_eq!(tags.iter().filter(|t| **t == "geoip-tw").count(), 1, "repeated countries share one rule set");
+
+        // A blocked GeoIP is a reject action; a blocked final's catch-all comes after it.
+        p.geoip.outbound = TAG_REJECT.into();
+        p.final_outbound = TAG_REJECT.into();
+        let c = generate(&p, &opts(&dir)).unwrap();
+        let r = rules(&c);
+        assert_eq!(r[r.len() - 2], json!({ "rule_set": ["geoip-tw", "geoip-jp"], "action": "reject" }));
+        assert_eq!(r[r.len() - 1], json!({ "network": ["tcp", "udp"], "action": "reject" }));
+        assert_eq!(c["route"]["final"], "direct", "the catch-all blocks; `final` has no selector then");
+
+        // Without countries the rule, its selector and its rule sets are skipped, without an error.
+        p.geoip = GeoIpGroup { countries: vec![" ".into(), String::new()], outbound: TAG_DIRECT.into() };
+        p.final_outbound = TAG_DIRECT.into();
+        let c = generate(&p, &opts(&dir)).unwrap();
+        assert_eq!(rules(&c).last().unwrap()["outbound"], "group-lan", "the groups are the last rules");
+        assert!(!has_outbound(&c, "geoip"));
+        let tags: Vec<&str> = c["route"]["rule_set"].as_array().unwrap().iter().map(|s| s["tag"].as_str().unwrap()).collect();
+        assert!(!tags.contains(&"geoip-tw"));
+    }
+
+    #[test]
+    fn final_and_global_mode_route_through_their_selectors() {
+        let mut p = sample_profile();
+        p.final_outbound = "mudfish-591".into();
+        p.global_outbound = "mudfish-655".into();
+        let c = generate(&p, &opts(&ruleset_dir())).unwrap();
+        assert_eq!(c["route"]["final"], "final");
+        assert_eq!(rules(&c)[4], json!({ "clash_mode": "Global", "action": "route", "outbound": "global" }));
+        assert_eq!(find_outbound(&c, "final")["default"], "mudfish-591");
+        assert_eq!(find_outbound(&c, "global")["default"], "mudfish-655");
+        assert_eq!(rules(&c).len(), 14, "no catch-all while final is not blocked");
     }
 
     #[test]
     fn quic_block_respects_group_priority() {
         // A higher-priority direct group for youtube.com must not lose QUIC to a lower proxied one.
-        let mut yt = RuleGroup::new("yt", "yt", Target::Direct);
+        let mut yt = RuleGroup::new("yt", "yt", TAG_DIRECT);
         yt.domain_suffixes = vec!["youtube.com".into()];
-        let mut google = RuleGroup::new("google", "google", Target::Proxy);
+        let mut google = RuleGroup::new("google", "google", TAG_AUTO);
         google.domain_suffixes = vec!["youtube.com".into(), "google.com".into()];
         let p = Profile { nodes: vec![node(591)], groups: vec![yt, google], ..Profile::default() };
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
@@ -729,6 +845,73 @@ mod tests {
         p.dns.block_quic_for_proxied = false;
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
         assert!(rules(&c).iter().all(|x| x["action"] != "reject"));
+    }
+
+    #[test]
+    fn direct_groups_get_no_fakeip_rule_and_no_quic_block() {
+        let dir = ruleset_dir();
+        let mut g = RuleGroup::new("d", "d", TAG_DIRECT);
+        g.domain_suffixes = vec!["example.com".into()];
+        g.rule_sets = vec!["geosite:category-games".into()];
+        let mut p = Profile { nodes: vec![node(591)], groups: vec![g], ..Profile::default() };
+
+        let c = generate(&p, &opts(&dir)).unwrap();
+        assert_eq!(c["dns"]["rules"].as_array().unwrap().len(), 3, "only the Direct, Global and Rule mode rules");
+        assert!(rules(&c).iter().all(|r| r["action"] != "reject"), "no QUIC block for a direct group");
+
+        // the same group through a node gets both its FakeIP rules and its QUIC block
+        p.groups[0].outbound = TAG_AUTO.into();
+        let c = generate(&p, &opts(&dir)).unwrap();
+        let dns = c["dns"]["rules"].as_array().unwrap();
+        assert_eq!(dns.len(), 5);
+        assert_eq!(dns[2]["domain_suffix"], json!(["example.com"]));
+        assert_eq!(dns[3]["rule_set"], json!(["geosite-category-games"]));
+        assert!(dns[2..4].iter().all(|r| r["server"] == "dns-fakeip"));
+        assert!(rules(&c).iter().any(|r| r["action"] == "reject" && r["type"] == "logical"));
+    }
+
+    /// A v0.4 file with one group that followed the default node and blocked its UDP.
+    fn v2_group_with_udp_policy(selected: &str) -> String {
+        format!(
+            r#"{{"schema_version": 2, "selected": "{selected}", "final_target": "direct",
+                "nodes": [{{"tag": "mudfish-591", "sid": 591, "name": "node 591", "server": "35.236.137.214", "port": 18081, "country": "TW"}}],
+                "groups": [{{"id": "g", "name": "g", "enabled": true, "target": "proxy", "outbound": "proxy", "udp": "reject", "domain_suffixes": ["example.com"]}}]}}"#
+        )
+    }
+
+    /// v3 cannot say "direct, but block its UDP": a group that followed a direct default node is a
+    /// plain direct group after the migration. Its UDP policy stays in the profile, but no UDP
+    /// guard, QUIC block or FakeIP rule is generated for it (an accepted loss).
+    #[test]
+    fn migrated_group_that_followed_a_direct_default_node_loses_its_udp_policy() {
+        let dir = ruleset_dir();
+        let mut p: Profile = serde_json::from_str(&v2_group_with_udp_policy("direct")).unwrap();
+        assert!(p.migrate());
+        assert_eq!(p.groups[0].outbound, TAG_DIRECT);
+        assert_eq!(p.groups[0].udp, UdpPolicy::Reject, "kept as it was, but inert");
+
+        let c = generate(&p, &opts(&dir)).unwrap();
+        let r = rules(&c);
+        assert!(r.iter().all(|x| x["type"] != "logical"), "no UDP guard or QUIC block for a direct group: {r:?}");
+        assert_eq!(r[5], json!({ "domain_suffix": ["example.com"], "action": "route", "outbound": "group-g" }), "its own rule comes first after the mode switches");
+        assert_eq!(c["dns"]["rules"].as_array().unwrap().len(), 3, "no FakeIP rule for its domain");
+        assert_eq!(find_outbound(&c, "group-g")["default"], "direct");
+
+        // the same file behind a node default node keeps the guard: that is what the direct case loses
+        let mut proxied: Profile = serde_json::from_str(&v2_group_with_udp_policy("mudfish-591")).unwrap();
+        assert!(proxied.migrate());
+        assert_eq!(proxied.groups[0].outbound, "mudfish-591");
+        let c = generate(&proxied, &opts(&dir)).unwrap();
+        let r = rules(&c);
+        assert_eq!(r[5]["type"], "logical", "UDP guard first");
+        assert_eq!(r[5]["action"], "reject");
+        assert_eq!(r[6]["outbound"], "group-g");
+        assert_eq!(c["dns"]["rules"].as_array().unwrap().len(), 4, "and its FakeIP rule");
+
+        // pointing the migrated direct group at the node brings the policy back
+        p.groups[0].outbound = "mudfish-591".into();
+        let c = generate(&p, &opts(&dir)).unwrap();
+        assert_eq!(rules(&c)[5]["action"], "reject");
     }
 
     #[test]
@@ -761,8 +944,13 @@ mod tests {
         assert_eq!(r[4]["rule_set"], json!(["geosite-category-games"]));
         assert!(r[1..5].iter().all(|x| x["server"] == "dns-fakeip"));
         assert_eq!(r[5], json!({ "clash_mode": "Rule", "action": "route", "server": "dns-local" }));
-        assert_eq!(r.len(), 6, "reject/direct groups and geoip sets stay out of DNS rules");
+        assert_eq!(r.len(), 6, "blocked/direct groups and geoip sets stay out of DNS rules");
         assert_eq!(c["dns"]["strategy"], "ipv4_only");
+        // GeoIP needs real IPs for every domain no group claimed
+        assert_eq!(c["dns"]["final"], "dns-local");
+
+        let remote = c["dns"]["servers"].as_array().unwrap().iter().find(|s| s["tag"] == "dns-remote").unwrap();
+        assert_eq!(remote["detour"], "auto");
 
         let mut p = sample_profile();
         p.dns.fakeip = false;
@@ -770,6 +958,9 @@ mod tests {
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
         assert_eq!(c["dns"]["rules"][1]["server"], "dns-remote");
         assert!(c["dns"].get("strategy").is_none());
+        assert_eq!(c["dns"]["final"], "dns-local");
+        let remote = c["dns"]["servers"].as_array().unwrap().iter().find(|s| s["tag"] == "dns-remote").unwrap();
+        assert_eq!(remote["detour"], "auto", "the proxy selector is gone; DNS goes through auto");
     }
 
     /// sing-box builds its switchable mode list from the `clash_mode` values in the rules.
@@ -800,22 +991,39 @@ mod tests {
         let base = sample_profile();
         let fp = restart_fingerprint(&base, &dir);
 
-        let mut live = base.clone();
-        live.selected = TAG_DIRECT.into();
-        live.mode = Mode::Global;
-        live.groups[1].outbound = TAG_AUTO.into();
-        live.groups[1].name = "renamed".into();
-        assert_eq!(restart_fingerprint(&live, &dir), fp, "selections and names apply without a restart");
+        // Everything a selector can be switched to without a restart.
+        for live in [
+            |p: &mut Profile| p.geoip.outbound = "mudfish-591".into(), // GeoIP: direct → node
+            |p: &mut Profile| p.final_outbound = "mudfish-655".into(), // final: direct → node
+            |p: &mut Profile| p.global_outbound = "mudfish-655".into(),
+            |p: &mut Profile| p.groups[1].outbound = TAG_AUTO.into(), // between nodes
+            |p: &mut Profile| p.groups[2].outbound = "mudfish-655".into(),
+            |p: &mut Profile| p.groups[4].outbound = TAG_AUTO.into(), // an IP-only group: nothing but its selector depends on direct vs proxy
+            |p: &mut Profile| p.mode = Mode::Global,
+            |p: &mut Profile| p.groups[1].name = "renamed".into(),
+        ] {
+            let mut p = base.clone();
+            live(&mut p);
+            assert_eq!(restart_fingerprint(&p, &dir), fp, "applies without a restart");
+        }
 
         let mut off = base.clone();
-        off.groups.push(RuleGroup::new("idle", "idle", Target::Proxy));
+        off.groups.push(RuleGroup::new("idle", "idle", TAG_AUTO));
         off.groups.last_mut().unwrap().enabled = false;
         assert_eq!(restart_fingerprint(&off, &dir), fp, "editing a disabled group needs no restart");
 
+        // Everything else changes the config itself.
         for change in [
             |p: &mut Profile| p.groups[2].domain_suffixes.push("example.com".into()),
             |p: &mut Profile| p.groups.swap(2, 3),
-            |p: &mut Profile| p.final_target = Target::Proxy,
+            // a domain group between direct and proxied: its FakeIP DNS rule and QUIC block come or go
+            |p: &mut Profile| p.groups[2].outbound = TAG_DIRECT.into(),
+            |p: &mut Profile| p.groups[4].outbound = TAG_REJECT.into(),
+            |p: &mut Profile| p.groups[1].outbound = TAG_REJECT.into(),
+            |p: &mut Profile| p.final_outbound = TAG_REJECT.into(),
+            |p: &mut Profile| p.geoip.outbound = TAG_REJECT.into(),
+            |p: &mut Profile| p.geoip.countries.push("jp".into()),
+            |p: &mut Profile| p.geoip.countries.clear(),
             |p: &mut Profile| p.log_level = LogLevel::Debug,
             |p: &mut Profile| p.nodes.pop().map(|_| ()).unwrap(),
         ] {
@@ -823,8 +1031,16 @@ mod tests {
             change(&mut p);
             assert_ne!(restart_fingerprint(&p, &dir), fp);
         }
+
+        // Unblocking a blocked group brings its selector back: a restart as well.
+        let mut blocked = base.clone();
+        blocked.groups[1].outbound = TAG_REJECT.into();
+        let mut unblocked = blocked.clone();
+        unblocked.groups[1].outbound = "mudfish-655".into();
+        assert_ne!(restart_fingerprint(&blocked, &dir), restart_fingerprint(&unblocked, &dir));
+
         let mut bad = base.clone();
-        bad.groups.push(RuleGroup::new("empty", "empty", Target::Proxy));
+        bad.groups.push(RuleGroup::new("empty", "empty", TAG_AUTO));
         assert_eq!(restart_fingerprint(&bad, &dir), Err("群組「empty」沒有任何比對條件".to_string()));
     }
 
@@ -832,32 +1048,40 @@ mod tests {
     fn selector_members_list_what_can_be_switched() {
         let c = generate(&sample_profile(), &opts(&ruleset_dir())).unwrap();
         let m = selector_members(&c);
-        assert_eq!(m.keys().map(String::as_str).collect::<Vec<_>>(), ["group-game", "group-games", "group-site", "proxy"]);
-        assert!(m["proxy"].contains("direct") && !m["group-game"].contains("direct"));
+        assert_eq!(
+            m.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["final", "geoip", "global", "group-game", "group-games", "group-lan", "group-site"]
+        );
+        assert!(m["final"].contains("direct") && m["group-game"].contains("direct"));
+        assert!(!m["global"].contains("direct") && m["global"].contains("auto"));
+        assert!(m.values().all(|members| !members.contains("reject")));
     }
 
     #[test]
     fn stale_outbounds_fall_back() {
         let mut p = sample_profile();
-        p.selected = "mudfish-1".into();
+        p.final_outbound = "mudfish-1".into();
+        p.geoip.outbound = "mudfish-1".into();
+        p.global_outbound = "mudfish-1".into();
         p.groups[1].outbound = "mudfish-2".into();
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        assert_eq!(find_outbound(&c, "proxy")["default"], "auto");
-        assert_eq!(find_outbound(&c, "group-game")["default"], "proxy");
+        for tag in ["final", "geoip", "global", "group-game"] {
+            assert_eq!(find_outbound(&c, tag)["default"], "auto", "{tag}");
+        }
     }
 
     #[test]
-    fn default_node_can_be_direct() {
+    fn fixed_groups_can_be_direct_a_node_or_auto() {
         let mut p = sample_profile();
-        p.selected = TAG_DIRECT.into();
-        p.groups[1].outbound = TAG_DIRECT.into();
+        p.final_outbound = "mudfish-591".into();
+        p.geoip.outbound = TAG_AUTO.into();
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        let main = find_outbound(&c, "proxy");
-        assert_eq!(main["outbounds"], json!(["auto", "direct", "mudfish-591", "mudfish-655"]));
-        assert_eq!(main["default"], "direct");
-        // groups pick direct via their target, not their outbound
-        assert!(!find_outbound(&c, "group-game")["outbounds"].as_array().unwrap().contains(&json!("direct")));
-        assert_eq!(find_outbound(&c, "group-game")["default"], "proxy");
+        assert_eq!(find_outbound(&c, "final")["default"], "mudfish-591");
+        assert_eq!(find_outbound(&c, "geoip")["default"], "auto");
+        // either can still go direct live
+        for tag in ["final", "geoip"] {
+            assert!(find_outbound(&c, tag)["outbounds"].as_array().unwrap().contains(&json!("direct")));
+        }
     }
 
     #[test]
@@ -885,9 +1109,10 @@ mod tests {
         assert_eq!(ep["peers"][0]["allowed_ips"], json!(["0.0.0.0/0", "::/0"]));
 
         // selectable everywhere, but not duplicated as a socks outbound
-        assert!(find_outbound(&c, "proxy")["outbounds"].as_array().unwrap().contains(&json!("warp-test")));
+        for tag in ["final", "geoip", "global", "group-game"] {
+            assert!(find_outbound(&c, tag)["outbounds"].as_array().unwrap().contains(&json!("warp-test")), "{tag}");
+        }
         assert_eq!(find_outbound(&c, "auto")["outbounds"], json!(["mudfish-591", "mudfish-655"]), "auto excludes WARP while Mudfish nodes exist");
-        assert!(find_outbound(&c, "group-game")["outbounds"].as_array().unwrap().contains(&json!("warp-test")));
         assert_eq!(find_outbound(&c, "group-game")["default"], "warp-test");
         assert!(c["outbounds"].as_array().unwrap().iter().all(|o| o["tag"] != "warp-test"));
     }
@@ -907,11 +1132,16 @@ mod tests {
     }
 
     #[test]
-    fn final_reject_adds_catch_all() {
+    fn blocked_final_adds_a_catch_all_instead_of_a_selector() {
         let mut p = sample_profile();
-        p.final_target = Target::Reject;
+        p.final_outbound = TAG_REJECT.into();
         let c = generate(&p, &opts(&ruleset_dir())).unwrap();
-        assert_eq!(rules(&c).last().unwrap()["action"], "reject");
+        let r = rules(&c);
+        assert_eq!(r[r.len() - 1], json!({ "network": ["tcp", "udp"], "action": "reject" }));
+        assert_eq!(r[r.len() - 2]["outbound"], "geoip", "GeoIP is decided before the catch-all");
+        assert_eq!(c["route"]["final"], "direct");
+        assert!(!has_outbound(&c, "final"));
+        assert!(!p.selections().selectors.contains_key("final"));
     }
 
     #[test]
@@ -925,27 +1155,38 @@ mod tests {
         let Ok(bin) = std::env::var("SINGBOX_BIN") else { return };
         let dir = ruleset_dir();
         let mut p = sample_profile();
-        let mut acl = RuleGroup::new("acl", "acl", Target::Proxy);
+        let mut acl = RuleGroup::new("acl", "acl", "warp-test");
         acl.rule_sets = vec!["acl:Steam".into()];
         acl.process_names = vec!["steam.exe".into()];
         acl.udp = UdpPolicy::Reject;
-        acl.outbound = "warp-test".into();
         p.groups.push(acl);
         p.nodes.push(warp_node());
         let keys = warp_keys();
         let mut o = opts(&dir);
         o.wireguard_keys = &keys;
         o.self_exe = Some(r"C:\Program Files\ProxyDesk\proxydesk.exe");
-        for (fakeip, final_target, selected) in [(true, Target::Direct, "auto"), (false, Target::Proxy, "direct"), (true, Target::Reject, "mudfish-591")] {
+        // (FakeIP, final, GeoIP outbound, GeoIP countries)
+        let cases = [
+            (true, TAG_DIRECT, "warp-test", vec!["tw"]),
+            (false, "mudfish-591", TAG_AUTO, vec!["tw", "jp"]),
+            (true, TAG_REJECT, TAG_DIRECT, vec!["tw"]),
+            (true, TAG_AUTO, TAG_REJECT, vec!["tw"]),
+            (true, TAG_DIRECT, TAG_DIRECT, vec![]),
+        ];
+        for (i, (fakeip, final_outbound, geoip_outbound, countries)) in cases.into_iter().enumerate() {
             p.dns.fakeip = fakeip;
-            p.final_target = final_target;
-            p.selected = selected.into();
+            p.final_outbound = final_outbound.into();
+            p.geoip = GeoIpGroup { countries: countries.into_iter().map(String::from).collect(), outbound: geoip_outbound.into() };
             let c = generate(&p, &o).unwrap();
-            let path = std::env::temp_dir().join(format!("proxydesk-check-{fakeip}-{final_target:?}.json"));
+            let path = std::env::temp_dir().join(format!("proxydesk-check-{i}.json"));
             std::fs::write(&path, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
             let out = std::process::Command::new(&bin).args(["check", "-c"]).arg(&path).output().unwrap();
             let _ = std::fs::remove_file(&path);
-            assert!(out.status.success(), "sing-box check failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "sing-box check failed for case {i} ({final_outbound}, GeoIP {geoip_outbound}, FakeIP {fakeip}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 }

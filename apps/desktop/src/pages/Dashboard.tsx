@@ -1,15 +1,15 @@
-import { useState } from "react";
-import { ArrowDown, ArrowUp, ListFilter } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { ArrowDown, ArrowUp, ListFilter, Lock } from "lucide-react";
 import type { PageId } from "../App";
-import { api, groupSelectorTag, type ClashProxy, type Mode, type RuleGroup } from "../lib/ipc";
+import { api, groupSelectorTag, TAG_FINAL, TAG_GEOIP, TAG_GLOBAL, type ClashProxy, type Mode } from "../lib/ipc";
 import { useApp, useInterval, useTraffic } from "../lib/store";
 import { formatBytes, formatElapsed, formatRate } from "../lib/format";
 import { Badge, Button, Card, cx, PageHeader, Segmented } from "../components/ui";
-import { DefaultNodeSelect, MatcherSummary, nodeDisplayName, OutboundSelect, resolveNode, TargetBadge } from "../components/groups";
+import { effectiveGlobal, effectiveOutbound, geoipSummary, MatcherSummary, nodeDisplayName, OutboundSelect, resolveNode } from "../components/groups";
 
 const MODES: { value: Mode; label: string; hint: string }[] = [
-  { value: "Rule", label: "規則", hint: "依分流群組決定走代理或直連" },
-  { value: "Global", label: "全域", hint: "所有流量都走預設節點" },
+  { value: "Rule", label: "規則", hint: "依分流群組、GeoIP 與 final 決定出口" },
+  { value: "Global", label: "全域", hint: "所有流量都走全域出口" },
   { value: "Direct", label: "直連", hint: "所有流量直連，不經過代理" },
 ];
 
@@ -32,17 +32,53 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
   if (!profile) return null;
 
   const nodeName = (tag?: string) => nodeDisplayName(profile, tag);
-  const defaultNow = running ? nodeName(resolveNode(proxies, "proxy")) : undefined;
+  /** The member the running core really uses behind a selector (`auto` resolved to its node). */
+  const actualOf = (selector: string) => (running ? resolveNode(proxies, selector) : undefined);
   const activeGroups = profile.groups.filter((g) => g.enabled);
+  const modeLabel = MODES.find((m) => m.value === profile.mode)?.label;
 
-  // Both apply live: the backend switches the running core's selector / mode.
-  const selectGroup = (g: RuleGroup, outbound: string) =>
-    updateProfile((p) => ({ ...p, groups: p.groups.map((x) => (x.id === g.id ? { ...x, outbound } : x)) })).then(() => {
-      if (running) refreshProxies();
-    });
+  // All of these apply live: the backend switches the running core's selector / mode.
+  const refreshLive = () => {
+    if (running) refreshProxies();
+  };
+  const selectGroup = (id: string, outbound: string) =>
+    updateProfile((p) => ({ ...p, groups: p.groups.map((x) => (x.id === id ? { ...x, outbound } : x)) })).then(refreshLive);
+  const selectGeoip = (outbound: string) => updateProfile((p) => ({ ...p, geoip: { ...p.geoip, outbound } })).then(refreshLive);
+  const selectFinal = (outbound: string) => updateProfile((p) => ({ ...p, final_outbound: outbound })).then(refreshLive);
+  const selectGlobal = (outbound: string) => updateProfile((p) => ({ ...p, global_outbound: outbound })).then(refreshLive);
   const setMode = (mode: Mode) => updateProfile((p) => ({ ...p, mode }));
 
-  const connCount = (g: RuleGroup) => conns.filter((c) => c.chains.includes(groupSelectorTag(g))).length;
+  /** The outbound a selector really uses; the profile's choice while not connected or when the running config has no such selector (it was blocked or empty at the start). */
+  const outboundValue = (outbound: string, selector: string) => (outbound === "reject" ? "阻擋" : (nodeName(actualOf(selector) ?? outbound) ?? "—"));
+  /** The 「目前使用」 line is worth showing only when the dropdown does not already tell: `auto`, or the core is elsewhere. */
+  const showActual = (selected: string, actual: string | undefined) => actual !== undefined && (selected === "auto" || actual !== selected);
+  const finalOutbound = effectiveOutbound(profile, profile.final_outbound);
+  const globalOutbound = effectiveGlobal(profile);
+  const globalNow = actualOf(TAG_GLOBAL);
+
+  /** One row of the routing card: a custom group, or the fixed GeoIP / final row. */
+  const routeRow = (r: { key: string; index?: number; title: string; subtitle: ReactNode; outbound: string; selector: string; onChange: (outbound: string) => void }) => {
+    const selected = effectiveOutbound(profile, r.outbound);
+    const blocked = selected === "reject";
+    const actual = blocked ? undefined : actualOf(r.selector);
+    const count = running && !blocked ? conns.filter((c) => c.chains.includes(r.selector)).length : undefined;
+    return (
+      <li key={r.key} className={cx("flex items-center gap-3 px-4 py-2.5", r.index === undefined && "bg-surface-2/50", profile.mode !== "Rule" && "opacity-55")}>
+        <span className="tabular flex w-5 justify-end text-xs text-muted" title={r.index === undefined ? "固定的群組" : "優先順序"}>
+          {r.index ?? <Lock size={12} aria-label="固定的群組" />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-medium">{r.title}</div>
+          {r.subtitle}
+        </div>
+        {count !== undefined && <Badge tone={count ? "accent" : "muted"}>{count} 條連線</Badge>}
+        <div className="flex w-72 shrink-0 flex-col items-end gap-0.5">
+          <OutboundSelect profile={profile} value={r.outbound} onChange={r.onChange} label={`${r.title} 的出口`} className="w-full" />
+          {showActual(selected, actual) && <span className="text-[11px] text-muted">目前使用：{nodeName(actual)}</span>}
+        </div>
+      </li>
+    );
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -66,11 +102,13 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
         )}
 
         <div className="grid grid-cols-4 gap-4">
-          <Stat
-            label="預設節點"
-            value={defaultNow ?? (running ? "測試中…" : (nodeName(profile.selected) ?? "—"))}
-            hint={profile.selected === "auto" ? "自動選擇最低延遲" : profile.selected === "direct" ? "不經過代理" : "手動指定"}
-          />
+          {profile.mode === "Rule" ? (
+            <Stat label="final" value={outboundValue(finalOutbound, TAG_FINAL)} hint="不符合任何規則的流量" />
+          ) : profile.mode === "Global" ? (
+            <Stat label="全域出口" value={outboundValue(globalOutbound, TAG_GLOBAL)} hint="所有流量都走這個出口" />
+          ) : (
+            <Stat label="出口" value="直接連線" hint="所有流量直連，不經過代理" />
+          )}
           <Stat label="上傳" value={traffic ? formatRate(traffic.up_rate) : "—"} hint={traffic ? `累計 ${formatBytes(traffic.upload_total)}` : undefined} icon={<ArrowUp size={14} />} />
           <Stat label="下載" value={traffic ? formatRate(traffic.down_rate) : "—"} hint={traffic ? `累計 ${formatBytes(traffic.download_total)}` : undefined} icon={<ArrowDown size={14} />} />
           <Stat label="連線數" value={running ? String(conns.length) : "—"} hint="目前開啟中的連線" />
@@ -80,6 +118,15 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
           <div className="flex items-center gap-4 px-4 py-3">
             <Segmented value={profile.mode} onChange={setMode} options={MODES} />
             <span className="text-xs text-muted">{MODES.find((m) => m.value === profile.mode)?.hint}</span>
+            {profile.mode === "Global" && (
+              <div className="ml-auto flex items-center gap-3">
+                <span className="text-xs font-medium">全域出口</span>
+                <div className="flex w-64 flex-col items-end gap-0.5">
+                  <OutboundSelect kind="global" label="全域出口" profile={profile} value={profile.global_outbound} onChange={selectGlobal} className="w-full" />
+                  {showActual(globalOutbound, globalNow) && <span className="text-[11px] text-muted">目前使用：{nodeName(globalNow)}</span>}
+                </div>
+              </div>
+            )}
           </div>
         </Card>
 
@@ -92,66 +139,44 @@ export default function Dashboard({ onNavigate }: { onNavigate: (p: PageId) => v
           }
         >
           {profile.mode !== "Rule" && (
-            <div className="border-b border-border bg-warn-soft px-4 py-2 text-xs text-warn">目前為「{MODES.find((m) => m.value === profile.mode)?.label}」模式，群組暫不生效；切回「規則」即恢復。</div>
+            <div className="border-b border-border bg-warn-soft px-4 py-2 text-xs text-warn">目前為「{modeLabel}」模式，分流暫不生效；切回「規則」即恢復。</div>
           )}
-          {activeGroups.length === 0 ? (
-            <div className="px-4 py-8 text-center text-xs text-muted">
-              <ListFilter size={22} className="mx-auto mb-2 opacity-50" />
-              沒有啟用的群組，所有流量依「其他流量」設定處理。
+          {activeGroups.length === 0 && (
+            <div className="flex items-center gap-2 border-b border-border px-4 py-3 text-xs text-muted">
+              <ListFilter size={16} className="shrink-0 opacity-50" />
+              沒有啟用的自訂群組，流量依下方的 GeoIP 與 final 處理。
             </div>
-          ) : (
-            <ol className="divide-y divide-border">
-              {activeGroups.map((g, i) => {
-                const actual = running && g.target === "proxy" ? nodeName(resolveNode(proxies, groupSelectorTag(g))) : undefined;
-                const count = running && g.target === "proxy" ? connCount(g) : undefined;
-                return (
-                  <li key={g.id} className={cx("flex items-center gap-3 px-4 py-2.5", profile.mode !== "Rule" && "opacity-55")}>
-                    <span className="tabular w-5 text-right text-xs text-muted" title="優先順序">
-                      {i + 1}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate font-medium">{g.name}</div>
-                      <MatcherSummary group={g} />
-                    </div>
-                    {count !== undefined && <Badge tone={count ? "accent" : "muted"}>{count} 條連線</Badge>}
-                    {g.target === "proxy" ? (
-                      <div className="flex w-72 shrink-0 flex-col items-end gap-0.5">
-                        <OutboundSelect profile={profile} value={g.outbound} onChange={(v) => selectGroup(g, v)} className="w-full" />
-                        {actual && <span className="text-[11px] text-muted">目前使用：{actual}</span>}
-                      </div>
-                    ) : (
-                      <div className="flex w-72 shrink-0 justify-end">
-                        <TargetBadge target={g.target} />
-                      </div>
-                    )}
-                  </li>
-                );
-              })}
-            </ol>
           )}
-          <div className={cx("flex items-center gap-3 border-t border-border bg-surface-2/50 px-4 py-2.5", profile.mode === "Direct" && "opacity-55")}>
-            <span className="w-5" />
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">預設節點</div>
-              <div className="truncate text-[11px] text-muted">「使用預設節點」的群組、全域模式與走代理的其他流量</div>
-            </div>
-            <div className="flex w-72 shrink-0 flex-col items-end gap-0.5">
-              <DefaultNodeSelect className="w-full" onChanged={running ? refreshProxies : undefined} />
-              {defaultNow && <span className="text-[11px] text-muted">目前使用：{defaultNow}</span>}
-            </div>
-          </div>
-          <div className={cx("flex items-center gap-3 border-t border-border px-4 py-2.5", profile.mode !== "Rule" && "opacity-55")}>
-            <span className="w-5" />
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">其他流量</div>
-              <div className="truncate text-[11px] text-muted">不符合任何群組的流量，可在「分流群組」頁更改</div>
-            </div>
-            <div className="flex w-72 shrink-0 justify-end">
-              <TargetBadge target={profile.final_target} detail={profile.final_target === "proxy" ? "預設節點" : undefined} />
-            </div>
-          </div>
+          <ol className="divide-y divide-border">
+            {activeGroups.map((g, i) =>
+              routeRow({
+                key: g.id,
+                index: i + 1,
+                title: g.name,
+                subtitle: <MatcherSummary group={g} />,
+                outbound: g.outbound,
+                selector: groupSelectorTag(g),
+                onChange: (outbound) => selectGroup(g.id, outbound),
+              }),
+            )}
+            {routeRow({
+              key: "geoip",
+              title: "GeoIP",
+              subtitle: <div className="truncate text-[11px] text-muted">{geoipSummary(profile.geoip.countries)}</div>,
+              outbound: profile.geoip.outbound,
+              selector: TAG_GEOIP,
+              onChange: selectGeoip,
+            })}
+            {routeRow({
+              key: "final",
+              title: "final",
+              subtitle: <div className="truncate text-[11px] text-muted">不符合以上任何規則的流量</div>,
+              outbound: profile.final_outbound,
+              selector: TAG_FINAL,
+              onChange: selectFinal,
+            })}
+          </ol>
         </Card>
-
       </div>
     </div>
   );

@@ -97,7 +97,7 @@ export default function Nodes() {
         await api.warpDiscard(n.tag).catch(() => {}); // best effort: never saved, do not leave the device registered
         return;
       }
-      toast(`已產生「${n.name}」（${n.wireguard?.address_v4}），可設為預設節點或在群組中選用。`, "success");
+      toast(`已產生「${n.name}」（${n.wireguard?.address_v4}），可在群組、GeoIP 或 final 中選用。`, "success");
     } catch (e) {
       toast(errorText(e), "error");
     } finally {

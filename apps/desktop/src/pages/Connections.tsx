@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Activity, Pause, Play, Search, XCircle } from "lucide-react";
-import { api, errorText, groupSelectorTag, type Connection, type RuleGroup, type Target } from "../lib/ipc";
+import { api, errorText, groupSelectorTag, TAG_FINAL, TAG_GEOIP, TAG_GLOBAL, type Connection, type RuleGroup } from "../lib/ipc";
 import { useApp, useInterval, useTraffic } from "../lib/store";
 import { basename, formatBytes, formatElapsed } from "../lib/format";
 import { Badge, Button, ContextMenu, cx, EmptyState, Input, PageHeader, Segmented, type MenuItem } from "../components/ui";
@@ -38,12 +38,18 @@ export default function Connections() {
     return list;
   }, [conns, q, filter, sort, running]);
 
-  const groupByTag = new Map((profile?.groups ?? []).map((g) => [groupSelectorTag(g), g]));
+  /** What the group column calls a selector: a custom group by name, the fixed ones and Global mode by role. */
+  const selectorLabels = new Map<string, string>([
+    [TAG_GLOBAL, "全域"],
+    [TAG_GEOIP, "GeoIP"],
+    [TAG_FINAL, "final"],
+    ...(profile?.groups ?? []).map((g): [string, string] => [groupSelectorTag(g), g.name]),
+  ]);
   const nodeName = (tag: string) => profile?.nodes.find((n) => n.tag === tag)?.name ?? tag;
 
-  /** New top-priority group for this program or domain. */
-  const createGroup = (kind: "app" | "domain", target: Target, value: string) => {
-    const g = newGroup(kind === "app" ? { name: value, target, process_names: [value] } : { name: value, target, domain_suffixes: [value] });
+  /** New top-priority group for this program or domain, sent through `auto` or direct. */
+  const createGroup = (kind: "app" | "domain", outbound: "auto" | "direct", value: string) => {
+    const g = newGroup(kind === "app" ? { name: value, outbound, process_names: [value] } : { name: value, outbound, domain_suffixes: [value] });
     updateProfile((p) => ({ ...p, groups: [g, ...p.groups] }));
     toast(`已新增最優先的群組「${g.name}」${running ? "，重新連線後生效" : ""}。`, "success");
   };
@@ -69,14 +75,14 @@ export default function Connections() {
     const items: MenuItem[] = [{ label: "關閉連線", onSelect: () => api.closeConnection(c.id).catch((e) => toast(errorText(e), "error")) }];
     if (proc) {
       items.push(
-        { label: `為「${proc}」建立走代理的群組`, separatorBefore: true, onSelect: () => createGroup("app", "proxy", proc) },
+        { label: `為「${proc}」建立走代理的群組`, separatorBefore: true, onSelect: () => createGroup("app", "auto", proc) },
         { label: `為「${proc}」建立直連的群組`, onSelect: () => createGroup("app", "direct", proc) },
         ...groups.map((g) => ({ label: `把「${proc}」加入「${g.name}」`, onSelect: () => addToGroup(g, "app", proc) })),
       );
     }
     if (host) {
       items.push(
-        { label: `為「${host}」建立走代理的群組`, separatorBefore: true, onSelect: () => createGroup("domain", "proxy", host) },
+        { label: `為「${host}」建立走代理的群組`, separatorBefore: true, onSelect: () => createGroup("domain", "auto", host) },
         { label: `為「${host}」建立直連的群組`, onSelect: () => createGroup("domain", "direct", host) },
         ...groups.map((g) => ({ label: `把「${host}」加入「${g.name}」`, onSelect: () => addToGroup(g, "domain", host) })),
       );
@@ -166,11 +172,11 @@ export default function Connections() {
                     </td>
                     <td className="truncate py-1.5">
                       {(() => {
-                        const g = c.chains.map((t) => groupByTag.get(t)).find(Boolean);
+                        const label = c.chains.map((t) => selectorLabels.get(t)).find(Boolean);
                         return (
                           <span className="flex items-center gap-1.5" title={c.chains.slice().reverse().join(" → ")}>
-                            {g && <span className="truncate text-xs">{g.name}</span>}
-                            {g && <span className="text-muted">→</span>}
+                            {label && <span className="truncate text-xs">{label}</span>}
+                            {label && <span className="text-muted">→</span>}
                             <Badge tone={proxied ? "accent" : "muted"}>{proxied ? nodeName(c.chains[0]) : "直連"}</Badge>
                           </span>
                         );

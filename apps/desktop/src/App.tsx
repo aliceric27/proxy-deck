@@ -143,6 +143,7 @@ function Banners({ onNavigate }: { onNavigate: (p: PageId) => void }) {
   const { snapshot } = useApp();
   if (!snapshot) return null;
   const items: { text: string; action?: { label: string; page: PageId } }[] = [];
+  if (snapshot.notice) items.push({ text: snapshot.notice }); // the profile was unreadable; its text says where the original is
   if (!snapshot.elevated) items.push({ text: "ProxyDesk 未以系統管理員身分執行，無法建立 TUN 介面卡。請關閉後以系統管理員身分重新開啟。" });
   if (!snapshot.sing_box_found) items.push({ text: "找不到 sing-box.exe，請重新安裝 ProxyDesk。" });
   const nodes = snapshot.profile.nodes;

@@ -1,17 +1,28 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowDown, ArrowUp, ChevronRight, Copy, FolderOpen, GripVertical, ListFilter, Plus, Search, Trash2 } from "lucide-react";
-import { api, errorText, type ProcessInfo, type RuleGroup, type RuleSetCatalog, type Target, type UdpPolicy } from "../lib/ipc";
+import { ArrowDown, ArrowUp, ChevronRight, Copy, FolderOpen, GripVertical, ListFilter, Lock, Plus, Search, Trash2 } from "lucide-react";
+import { api, errorText, type GeoIpGroup, type Profile, type ProcessInfo, type RuleGroup, type RuleSetCatalog, type UdpPolicy } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { newId } from "../lib/format";
 import { Button, ChipInput, ContextMenu, cx, EmptyState, IconButton, Input, Modal, PageHeader, Segmented, Select, Toggle, type MenuItem } from "../components/ui";
-import { DefaultNodeSelect, MATCHER_META, MatcherSummary, matcherCounts, matcherPreview, newGroup, OutboundSelect, outboundLabel, TargetBadge, type MatcherKind } from "../components/groups";
+import {
+  geoipLabel,
+  geoipSummary,
+  isProxied,
+  MATCHER_META,
+  MatcherSummary,
+  matcherCounts,
+  matcherPreview,
+  newGroup,
+  OutboundBadge,
+  OutboundSelect,
+  uniqueCodes,
+  type MatcherKind,
+} from "../components/groups";
 
-const TARGETS: { value: Target; label: string }[] = [
-  { value: "proxy", label: "走代理" },
-  { value: "direct", label: "直連" },
-  { value: "reject", label: "阻擋" },
-];
+/** `selectedId` of the fixed rows; custom groups use their own id. */
+const GEOIP_ID = "@geoip";
+const FINAL_ID = "@final";
 
 /** Windows `process_name` matches the full file name, so `steam` must become `steam.exe`. */
 function normalizeExe(name: string): string {
@@ -87,7 +98,7 @@ export default function Groups() {
     <div className="flex h-full flex-col">
       <PageHeader
         title="分流群組"
-        subtitle={`由上而下比對，越上面優先權越高；拖曳列表可調整順序。已啟用 ${enabledCount} / ${groups.length} 個群組。`}
+        subtitle={`由上而下比對；都不符合時依序比對 GeoIP 與 final。拖曳列表可調整順序，已啟用 ${enabledCount} / ${groups.length} 個群組。`}
         actions={
           <Button variant="primary" icon={<Plus size={14} />} onClick={add}>
             新增群組
@@ -98,8 +109,8 @@ export default function Groups() {
         <section className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-auto">
             {groups.length === 0 ? (
-              <EmptyState icon={<ListFilter size={28} />} title="沒有群組">
-                一個群組可以同時包含應用程式、網域、規則集與 IP 範圍，符合任一條件的流量就會走這個群組指定的出口，例如「遊戲」群組走日本節點、「影音」群組走台灣節點。
+              <EmptyState icon={<ListFilter size={28} />} title="沒有自訂群組">
+                一個群組可以同時包含應用程式、網域、規則集與 IP 範圍，符合任一條件的流量就會走這個群組指定的出口，例如「遊戲」群組走日本節點、「影音」群組走台灣節點。沒有群組可以套用的流量，會依序交給下方的 GeoIP 與 final。
               </EmptyState>
             ) : (
               <ol onDragLeave={() => setDropIndex(null)}>
@@ -156,7 +167,7 @@ export default function Groups() {
                       </div>
                       <div className="truncate font-mono text-[11px] text-muted">{matcherPreview(g) || "—"}</div>
                     </div>
-                    <TargetBadge target={g.target} detail={g.target === "proxy" ? outboundLabel(profile, g.outbound) : undefined} />
+                    <OutboundBadge profile={profile} outbound={g.outbound} />
                     <div className="flex opacity-0 group-hover:opacity-100">
                       <IconButton label="上移" disabled={i === 0} onClick={(e) => (e.stopPropagation(), moveTo(g.id, i - 1))}>
                         <ArrowUp size={14} />
@@ -169,12 +180,43 @@ export default function Groups() {
                 ))}
               </ol>
             )}
-          </div>
-          <div className="flex items-center gap-3 border-t border-border px-6 py-2.5 text-[13px]">
-            <span className="text-muted">不符合任何群組的流量：</span>
-            <Select label="其他流量" value={profile.final_target} onChange={(v) => updateProfile((p) => ({ ...p, final_target: v }))} options={TARGETS} className="w-28" />
-            <span className="ml-auto text-muted">預設節點：</span>
-            <DefaultNodeSelect className="w-64" />
+            {/* The last two rules of the list. A group dropped here lands after the last custom group: nothing can follow GeoIP and final. */}
+            <div
+              className={cx("bg-surface-2/40", groups.length === 0 && "border-t border-border")}
+              onDragOver={(e) => {
+                if (!dragId) return;
+                e.preventDefault();
+                setDropIndex(groups.length);
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropIndex(null);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const last = groups.length - 1;
+                if (dragId && groups[last]?.id !== dragId) moveTo(dragId, last);
+                setDragId(null);
+                setDropIndex(null);
+              }}
+            >
+              <p className="px-6 pt-2 pb-1 text-[11px] text-muted">{groups.length ? "以上群組都不符合時，依序比對：" : "流量依序比對："}</p>
+              <FixedRow
+                title="GeoIP"
+                subtitle={geoipSummary(profile.geoip.countries)}
+                profile={profile}
+                outbound={profile.geoip.outbound}
+                selected={selectedId === GEOIP_ID}
+                onSelect={() => setSelectedId(GEOIP_ID)}
+              />
+              <FixedRow
+                title="final"
+                subtitle="不符合以上任何規則的流量"
+                profile={profile}
+                outbound={profile.final_outbound}
+                selected={selectedId === FINAL_ID}
+                onSelect={() => setSelectedId(FINAL_ID)}
+              />
+            </div>
           </div>
         </section>
 
@@ -188,9 +230,34 @@ export default function Groups() {
             onClose={() => setSelectedId(null)}
           />
         )}
+        {selectedId === GEOIP_ID && <GeoIpEditor onClose={() => setSelectedId(null)} />}
+        {selectedId === FINAL_ID && <FinalEditor onClose={() => setSelectedId(null)} />}
       </div>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={rowMenu(menu.group)} onClose={() => setMenu(null)} />}
     </div>
+  );
+}
+
+/** A fixed row after the custom groups: it cannot be dragged, toggled or deleted, only edited. */
+function FixedRow({ title, subtitle, profile, outbound, selected, onSelect }: { title: string; subtitle: string; profile: Profile; outbound: string; selected: boolean; onSelect: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-current={selected ? "true" : undefined}
+      className={cx("flex w-full cursor-default items-center gap-3 border-b border-border px-4 py-2.5 text-left hover:bg-surface-2", selected && "bg-accent-soft/60")}
+    >
+      {/* Same columns as a custom row (grip, priority, toggle), so the names line up. */}
+      <Lock size={14} className="shrink-0 text-muted" aria-label="固定的群組" />
+      <span className="w-5" />
+      <span className="w-9 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-medium">{title}</div>
+        <div className="truncate text-[11px] text-muted">{subtitle}</div>
+      </div>
+      <OutboundBadge profile={profile} outbound={outbound} />
+      <span className="w-14 shrink-0" />
+    </button>
   );
 }
 
@@ -219,6 +286,22 @@ function Section({ kind, count, defaultOpen, children }: { kind: MatcherKind; co
   );
 }
 
+/** Right-hand panel shell shared by the editors. */
+function EditorFrame({ title, onClose, footer, children }: { title: string; onClose: () => void; footer?: ReactNode; children: ReactNode }) {
+  return (
+    <aside className="flex w-[460px] shrink-0 flex-col border-l border-border bg-surface" aria-label={title}>
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <h2 className="text-[13px] font-semibold">{title}</h2>
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          完成
+        </Button>
+      </div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">{children}</div>
+      {footer}
+    </aside>
+  );
+}
+
 function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: RuleGroup; fresh: boolean; onChange: (p: Partial<RuleGroup>) => void; onDelete: () => void; onClose: () => void }) {
   const { profile, toast } = useApp();
   const [name, setName] = useState(g.name);
@@ -236,14 +319,21 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
   };
 
   return (
-    <aside className="flex w-[460px] shrink-0 flex-col border-l border-border bg-surface" aria-label="編輯群組">
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
-        <h2 className="text-[13px] font-semibold">編輯群組</h2>
-        <Button size="sm" variant="ghost" onClick={onClose}>
-          完成
-        </Button>
-      </div>
-      <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">
+    <>
+      <EditorFrame
+        title="編輯群組"
+        onClose={onClose}
+        footer={
+          <div className="flex justify-between border-t border-border p-4">
+            <Button variant="danger" icon={<Trash2 size={14} />} onClick={onDelete}>
+              刪除群組
+            </Button>
+            <Button variant="ghost" icon={<Copy size={14} />} onClick={() => navigator.clipboard.writeText(JSON.stringify(g, null, 2))}>
+              複製 JSON
+            </Button>
+          </div>
+        }
+      >
         <Field label="名稱">
           <Input
             className="w-full"
@@ -255,28 +345,23 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
             onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
           />
         </Field>
-        <Field label="符合時">
-          <Segmented value={g.target} onChange={(target) => onChange({ target })} options={TARGETS} />
+        <Field label="出口" hint="連線中可在總覽頁即時切換；直連與代理互換時，部分規則要重新連線才完整生效，改成或離開「阻擋」也需要重新連線。">
+          <OutboundSelect profile={profile} value={g.outbound} onChange={(outbound) => onChange({ outbound })} className="w-full" />
         </Field>
-        {g.target === "proxy" && (
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="出口節點" hint="連線中也可以在總覽頁即時切換。">
-              <OutboundSelect profile={profile} value={g.outbound} onChange={(outbound) => onChange({ outbound })} className="w-full" />
-            </Field>
-            <Field label="UDP 流量" hint="遊戲通常使用 UDP。">
-              <Select<UdpPolicy>
-                label="UDP 流量"
-                value={g.udp}
-                onChange={(udp) => onChange({ udp })}
-                className="w-full"
-                options={[
-                  { value: "follow", label: "一起走代理" },
-                  { value: "direct", label: "UDP 直連" },
-                  { value: "reject", label: "阻擋 UDP" },
-                ]}
-              />
-            </Field>
-          </div>
+        {isProxied(profile, g.outbound) && (
+          <Field label="UDP 流量" hint="遊戲通常使用 UDP。">
+            <Select<UdpPolicy>
+              label="UDP 流量"
+              value={g.udp}
+              onChange={(udp) => onChange({ udp })}
+              className="w-full"
+              options={[
+                { value: "follow", label: "一起走代理" },
+                { value: "direct", label: "UDP 直連" },
+                { value: "reject", label: "阻擋 UDP" },
+              ]}
+            />
+          </Field>
         )}
 
         <div className="space-y-1.5">
@@ -323,15 +408,7 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
             <ChipInput mono values={g.ip_cidrs} onChange={(ip_cidrs) => onChange({ ip_cidrs })} placeholder="203.0.113.0/24" />
           </Field>
         </Section>
-      </div>
-      <div className="flex justify-between border-t border-border p-4">
-        <Button variant="danger" icon={<Trash2 size={14} />} onClick={onDelete}>
-          刪除群組
-        </Button>
-        <Button variant="ghost" icon={<Copy size={14} />} onClick={() => navigator.clipboard.writeText(JSON.stringify(g, null, 2))}>
-          複製 JSON
-        </Button>
-      </div>
+      </EditorFrame>
       {picker && (
         <ProcessPicker
           onClose={() => setPicker(false)}
@@ -342,7 +419,120 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
           }
         />
       )}
-    </aside>
+    </>
+  );
+}
+
+/** Traffic whose destination IP belongs to the chosen countries or regions: right after the custom groups. */
+function GeoIpEditor({ onClose }: { onClose: () => void }) {
+  const { profile, updateProfile, toast } = useApp();
+  const [catalog, setCatalog] = useState<RuleSetCatalog | null>(null);
+  const [q, setQ] = useState("");
+  useEffect(() => {
+    api.ruleSetCatalog().then(setCatalog).catch((e) => toast(errorText(e), "error"));
+  }, [toast]);
+  const visible = useMemo(() => {
+    const ql = q.trim().toLowerCase();
+    return (catalog?.geoip ?? []).filter((c) => !ql || c.toLowerCase().includes(ql) || geoipLabel(c).toLowerCase().includes(ql));
+  }, [catalog, q]);
+  if (!profile) return null;
+
+  // The countries as the generator reads them: trimmed, unique, no blanks.
+  const codes = uniqueCodes(profile.geoip.countries);
+  const lastOne = codes.length <= 1;
+  const setGeoip = (p: Partial<GeoIpGroup>) => updateProfile((pr) => ({ ...pr, geoip: { ...pr.geoip, ...p } }));
+  /** Adds or removes `code`. Decided against the latest profile, and the list never ends up empty. */
+  const toggle = (code: string) => {
+    if (lastOne && codes.includes(code)) return void toast("至少要保留一個國家或地區。");
+    updateProfile((pr) => {
+      const current = uniqueCodes(pr.geoip.countries);
+      if (!current.includes(code)) return { ...pr, geoip: { ...pr.geoip, countries: [...current, code] } };
+      if (current.length <= 1) return pr;
+      return { ...pr, geoip: { ...pr.geoip, countries: current.filter((c) => c !== code) } };
+    });
+  };
+
+  return (
+    <EditorFrame title="編輯 GeoIP" onClose={onClose}>
+      <p className="text-[11px] leading-relaxed text-muted">目的地 IP 屬於下列國家或地區、又不符合任何自訂群組的流量，會走這個出口。這是固定的群組，無法刪除或停用。</p>
+      <Field label="出口" hint="連線中也可以在總覽頁即時切換；改成或離開「阻擋」需要重新連線。">
+        <OutboundSelect profile={profile} value={profile.geoip.outbound} onChange={(outbound) => setGeoip({ outbound })} className="w-full" />
+      </Field>
+      <Field
+        label={`國家與地區（${codes.length}）`}
+        hint={
+          codes.length === 1 ? (
+            <span className="text-warn">至少要保留一個國家或地區，無法再移除。</span>
+          ) : codes.length > 1 ? (
+            "點擊標籤即可移除，也可以在下方搜尋後勾選新增。"
+          ) : (
+            "在下方搜尋後勾選新增。"
+          )
+        }
+      >
+        {codes.length === 0 ? (
+          <p className="text-[11px] text-warn">尚未選擇國家或地區，GeoIP 規則不會生效。</p>
+        ) : (
+          <div className="flex flex-wrap gap-1">
+            {codes.map((c) => (
+              <button
+                key={c}
+                onClick={() => toggle(c)}
+                disabled={lastOne}
+                title={lastOne ? "至少要保留一個國家或地區" : "點擊移除"}
+                className="rounded bg-accent-soft px-1.5 py-0.5 text-xs text-accent hover:bg-danger-soft hover:text-danger disabled:pointer-events-none"
+              >
+                {geoipLabel(c)}
+                {!lastOne && " ×"}
+              </button>
+            ))}
+          </div>
+        )}
+      </Field>
+      <Field label="新增國家或地區" hint="可以用國家名稱或代碼搜尋。">
+        <Input className="w-full" placeholder="搜尋，例如 日本 或 jp…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <ul className="h-64 overflow-auto rounded-md border border-border">
+          {catalog === null && <li className="px-2.5 py-3 text-center text-xs text-muted">讀取中…</li>}
+          {catalog !== null && visible.length === 0 && <li className="px-2.5 py-3 text-center text-xs text-muted">沒有符合的項目</li>}
+          {visible.map((c) => {
+            const on = codes.includes(c);
+            const locked = on && lastOne;
+            return (
+              <li key={c}>
+                <button
+                  onClick={() => toggle(c)}
+                  disabled={locked}
+                  title={locked ? "至少要保留一個國家或地區" : undefined}
+                  className={cx("flex w-full items-center gap-2 px-2.5 py-1 text-left text-xs hover:bg-surface-2 disabled:pointer-events-none disabled:opacity-60", on && "text-accent")}
+                >
+                  <input type="checkbox" readOnly checked={on} tabIndex={-1} className="h-3 w-3 accent-[var(--accent)]" />
+                  {geoipLabel(c)}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </Field>
+    </EditorFrame>
+  );
+}
+
+/** Everything no custom group and no GeoIP country claimed: the last row. */
+function FinalEditor({ onClose }: { onClose: () => void }) {
+  const { profile, updateProfile } = useApp();
+  if (!profile) return null;
+  return (
+    <EditorFrame title="編輯 final" onClose={onClose}>
+      <p className="text-[11px] leading-relaxed text-muted">所有自訂群組與 GeoIP 都不符合的流量，會走這個出口。這是最後一條規則，無法刪除或停用。</p>
+      <Field label="出口" hint="連線中也可以在總覽頁即時切換；改成或離開「阻擋」需要重新連線。">
+        <OutboundSelect profile={profile} value={profile.final_outbound} onChange={(final_outbound) => updateProfile((p) => ({ ...p, final_outbound }))} className="w-full" />
+      </Field>
+      {isProxied(profile, profile.final_outbound) && (
+        <p className="rounded-md bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-muted">
+          走代理時，不屬於任何自訂群組的網域會先在本機解析，再把 IP 交給節點。要讓節點負責解析網域，請把該網域加進自訂群組。
+        </p>
+      )}
+    </EditorFrame>
   );
 }
 
