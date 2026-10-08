@@ -151,6 +151,7 @@ pub fn run() {
             commands::custom_node_build,
             commands::custom_node_store_auth,
             commands::custom_node_username,
+            commands::parse_group_import,
             commands::ping_nodes,
             commands::core_start,
             commands::core_stop,

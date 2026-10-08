@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use proxy_core::custom::{self, CustomNodeInput, ProxyLink};
+use proxy_core::import::{self, GroupImport, ImportContext};
 use proxy_core::singbox::restart_fingerprint;
 use proxy_core::{Profile, ProxyNode};
 use serde::Serialize;
@@ -154,6 +155,20 @@ pub async fn custom_node_username(state: State<'_, AppState>, tag: String) -> Cm
         return Ok(None);
     }
     Ok(credentials::load_proxy_auth(&tag).map(|a| a.username))
+}
+
+/// Reads pasted or uploaded JSON (ProxyDesk groups, Karing diversion rules, a sing-box rule set or
+/// config) into groups for the import dialog to show; nothing is stored, the dialog adds the groups
+/// it keeps through `save_profile`. `name` (the uploaded file's) names a group the JSON leaves unnamed.
+#[tauri::command]
+pub async fn parse_group_import(state: State<'_, AppState>, text: String, name: Option<String>) -> CmdResult<GroupImport> {
+    let catalog = system::rule_set_catalog(&state.paths.ruleset_dir);
+    let rule_sets: Vec<String> = [("geosite", &catalog.geosite), ("geoip", &catalog.geoip), ("acl", &catalog.acl)]
+        .into_iter()
+        .flat_map(|(kind, codes)| codes.iter().map(move |c| format!("{kind}:{c}")))
+        .collect();
+    let profile = state.profile.read().await;
+    import::parse_group_import(&text, &ImportContext { profile: &profile, rule_sets: &rule_sets, name: name.as_deref().unwrap_or_default() })
 }
 
 #[tauri::command]

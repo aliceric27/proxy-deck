@@ -6,7 +6,7 @@ Windows 桌面代理客戶端：從 Mudfish 取得 SOCKS5 節點，用 sing-box 
 
 分流由上而下比對：自訂群組 → GeoIP → final。
 
-- **自訂群組**：一個群組可以同時包含程式、網域、規則集與 IP 範圍，各自指定出口（直接連線、阻擋、自動選擇或某個節點），並依優先順序比對。
+- **自訂群組**：一個群組可以同時包含程式、網域、規則集與 IP 範圍，各自指定出口（直接連線、阻擋、自動選擇或某個節點），並依優先順序比對。也可以從「新增群組 → 匯入設定」貼上或選擇 JSON 檔，一次加入多個群組（ProxyDesk 群組、Karing 分流規則、sing-box 規則集或設定檔的路由規則）。
 - **GeoIP**：目的地 IP 屬於所選國家或地區（預設台灣）的流量，套用一個出口。
 - **final**：以上都不符合的流量，套用一個出口（預設直接連線）。
 
@@ -45,7 +45,7 @@ M0 驗證環境：`docker/m0/`（Linux 容器，見該目錄 README）與 `docs/
 ## 專案結構
 
 ```
-crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、手動節點（連結解析）、Profile → sing-box JSON（純邏輯，有單元測試）
+crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、手動節點（連結解析）、群組匯入（JSON）、Profile → sing-box JSON（純邏輯，有單元測試）
 apps/desktop/src-tauri/   Tauri 後端：sing-box 子程序管理、Clash API client、認證管理員、系統匣
 apps/desktop/src/         React 前端：總覽、節點、分流群組、連線、日誌、設定
 docker/m0/                M0 Docker 驗證環境

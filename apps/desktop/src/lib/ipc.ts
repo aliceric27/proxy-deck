@@ -6,6 +6,7 @@ import type { AccountCheck } from "./bindings/AccountCheck";
 import type { ClashProxy } from "./bindings/ClashProxy";
 import type { CoreStatus } from "./bindings/CoreStatus";
 import type { CustomNodeInput } from "./bindings/CustomNodeInput";
+import type { GroupImport } from "./bindings/GroupImport";
 import type { LogBatch } from "./bindings/LogBatch";
 import type { NodeList } from "./bindings/NodeList";
 import type { PingResult } from "./bindings/PingResult";
@@ -26,6 +27,8 @@ export type { CoreStatus } from "./bindings/CoreStatus";
 export type { CustomNodeInput } from "./bindings/CustomNodeInput";
 export type { CustomProxy } from "./bindings/CustomProxy";
 export type { GeoIpGroup } from "./bindings/GeoIpGroup";
+export type { GroupImport } from "./bindings/GroupImport";
+export type { ImportedGroup } from "./bindings/ImportedGroup";
 export type { LogBatch } from "./bindings/LogBatch";
 export type { LogLevel } from "./bindings/LogLevel";
 export type { MatchMode } from "./bindings/MatchMode";
@@ -70,6 +73,8 @@ export const api = {
   customNodeStoreAuth: (tag: string, input: CustomNodeInput) => invoke<void>("custom_node_store_auth", { tag, input }),
   /** The stored username of a hand-added node (`null`: no readable account); the password never leaves the backend. */
   customNodeUsername: (tag: string) => invoke<string | null>("custom_node_username", { tag }),
+  /** Reads pasted JSON (ProxyDesk groups, Karing rules, a sing-box rule set or config) into groups to add; nothing is stored. `name` names an unnamed group. */
+  parseGroupImport: (text: string, name: string | null) => invoke<GroupImport>("parse_group_import", { text, name }),
   ping: (ips: string[]) => invoke<PingResult[]>("ping_nodes", { ips }),
   start: () => invoke<void>("core_start"),
   stop: () => invoke<void>("core_stop"),

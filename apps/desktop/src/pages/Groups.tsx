@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowDown, ArrowUp, ChevronRight, Copy, FolderOpen, GripVertical, ListFilter, Lock, Plus, Search, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Copy, FolderOpen, GripVertical, ListFilter, Lock, Plus, Search, Trash2 } from "lucide-react";
 import { api, errorText, type GeoIpGroup, type Profile, type ProcessInfo, type RuleGroup, type RuleSetCatalog, type UdpPolicy } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { newId } from "../lib/format";
 import { Button, ChipInput, ContextMenu, cx, EmptyState, IconButton, Input, Modal, PageHeader, Segmented, Select, Toggle, type MenuItem } from "../components/ui";
+import { GroupImportDialog } from "../components/GroupImportDialog";
 import {
   geoipLabel,
   geoipSummary,
@@ -38,6 +39,9 @@ export default function Groups() {
   const [menu, setMenu] = useState<{ x: number; y: number; group: RuleGroup } | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  /** The「新增群組」menu, anchored under its button. */
+  const [addMenu, setAddMenu] = useState<{ x: number; y: number } | null>(null);
+  const [importing, setImporting] = useState(false);
 
   if (!profile) return null;
   const groups = profile.groups;
@@ -101,8 +105,20 @@ export default function Groups() {
         title="分流群組"
         subtitle={`由上而下比對；都不符合時依序比對 GeoIP 與 final。拖曳列表可調整順序，已啟用 ${enabledCount} / ${groups.length} 個群組。`}
         actions={
-          <Button variant="primary" icon={<Plus size={14} />} onClick={add}>
+          <Button
+            variant="primary"
+            icon={<Plus size={14} />}
+            aria-haspopup="menu"
+            aria-expanded={addMenu !== null}
+            // While the menu is open, a press on the button closes it here instead of through the menu's outside-press handler (which would let the click reopen it).
+            onMouseDown={(e) => addMenu && e.stopPropagation()}
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              setAddMenu((m) => (m ? null : { x: r.right - 192, y: r.bottom + 4 }));
+            }}
+          >
             新增群組
+            <ChevronDown size={12} className="-mr-0.5 opacity-80" />
           </Button>
         }
       />
@@ -111,7 +127,7 @@ export default function Groups() {
           <div className="min-h-0 flex-1 overflow-auto">
             {groups.length === 0 ? (
               <EmptyState icon={<ListFilter size={28} />} title="沒有自訂群組">
-                一個群組可以同時包含應用程式、網域、規則集與 IP 範圍，符合任一條件的流量就會走這個群組指定的出口，例如「遊戲」群組走日本節點、「影音」群組走台灣節點。沒有群組可以套用的流量，會依序交給下方的 GeoIP 與 final。
+                一個群組可以同時包含應用程式、網域、規則集與 IP 範圍，符合任一條件的流量就會走這個群組指定的出口，例如「遊戲」群組走日本節點、「影音」群組走台灣節點。沒有群組可以套用的流量，會依序交給下方的 GeoIP 與 final。也可以從「新增群組 → 匯入設定」貼上 JSON，一次加入多個群組。
               </EmptyState>
             ) : (
               <ol onDragLeave={() => setDropIndex(null)}>
@@ -235,6 +251,26 @@ export default function Groups() {
         {selectedId === FINAL_ID && <FinalEditor onClose={() => setSelectedId(null)} />}
       </div>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={rowMenu(menu.group)} onClose={() => setMenu(null)} />}
+      {addMenu && (
+        <ContextMenu
+          x={addMenu.x}
+          y={addMenu.y}
+          onClose={() => setAddMenu(null)}
+          items={[
+            { label: "空白群組", onSelect: add },
+            { label: "匯入設定（JSON）…", onSelect: () => setImporting(true) },
+          ]}
+        />
+      )}
+      {importing && (
+        <GroupImportDialog
+          onClose={() => setImporting(false)}
+          onImported={(ids) => {
+            setImporting(false);
+            setSelectedId(ids[0] ?? null);
+          }}
+        />
+      )}
     </div>
   );
 }
