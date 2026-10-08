@@ -129,6 +129,7 @@ impl MudfishNode {
             country: self.country.clone(),
             udp: true,
             wireguard: None,
+            custom: None,
         }
     }
 }

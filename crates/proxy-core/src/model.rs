@@ -26,7 +26,8 @@ pub const TAG_GLOBAL: &str = "global";
 #[ts(export)]
 pub struct Profile {
     pub schema_version: u32,
-    /// Nodes the user picked from the Mudfish list; order is display order.
+    /// Nodes the user picked from the Mudfish list, generated (WARP) or added by hand; order is
+    /// display order.
     pub nodes: Vec<ProxyNode>,
     /// Custom groups in priority order; the first group that matches decides. GeoIP and
     /// `final` are tried after all of them.
@@ -82,30 +83,66 @@ impl Default for Profile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[ts(export)]
 pub struct ProxyNode {
-    /// sing-box outbound/endpoint tag, unique within the profile (`mudfish-591`, `warp-1a2b3c4d`).
+    /// sing-box outbound/endpoint tag, unique within the profile (`mudfish-591`, `warp-1a2b3c4d`,
+    /// `custom-1a2b3c4d`).
     pub tag: String,
     /// Mudfish `sid`; 0 for non-Mudfish nodes.
     #[serde(default)]
     pub sid: u32,
     pub name: String,
-    /// SOCKS server, or the WireGuard peer host for WARP.
+    /// SOCKS or HTTP proxy server, or the WireGuard peer host for WARP.
     pub server: String,
     pub port: u16,
+    /// Country code from the Mudfish list (`CF` for WARP); empty for nodes added by hand.
     pub country: String,
     /// UDP over this node; Mudfish nodes support UDP ASSOCIATE, but a node can be forced TCP-only.
+    /// Always off for an HTTP proxy, which only tunnels TCP.
     #[serde(default = "default_true")]
     pub udp: bool,
-    /// Present for Cloudflare WARP (WireGuard) nodes; absent means Mudfish SOCKS5.
-    /// The private key is not stored here (Windows Credential Manager, keyed by `tag`).
+    /// Present for Cloudflare WARP (WireGuard) nodes. Without it and without `custom`, the node
+    /// is a Mudfish SOCKS5 node. The private key is not stored here (Windows Credential Manager,
+    /// keyed by `tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub wireguard: Option<WireguardPeer>,
+    /// Present for a proxy the user added by hand: an HTTP or SOCKS5 server with an account of
+    /// its own (Webshare and the like). Its username and password are not stored here (Windows
+    /// Credential Manager, keyed by `tag`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub custom: Option<CustomProxy>,
 }
 
 impl ProxyNode {
     pub fn is_wireguard(&self) -> bool {
         self.wireguard.is_some()
     }
+
+    /// A proxy added by hand (`custom`); WARP wins if a hand-edited file sets both.
+    pub fn is_custom(&self) -> bool {
+        self.custom.is_some() && !self.is_wireguard()
+    }
+
+    /// A node from the Mudfish list: it signs in with the Mudfish account.
+    pub fn is_mudfish(&self) -> bool {
+        self.custom.is_none() && !self.is_wireguard()
+    }
+}
+
+/// The server half of a hand-added node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct CustomProxy {
+    pub protocol: ProxyProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ProxyProtocol {
+    /// HTTP CONNECT proxy: TCP only.
+    Http,
+    Socks5,
 }
 
 /// Public half of a WireGuard (WARP) device registration.
@@ -581,6 +618,7 @@ mod tests {
             country: "TW".into(),
             udp: true,
             wireguard: None,
+            custom: None,
         }
     }
 
@@ -904,5 +942,38 @@ mod tests {
         assert!(p.is_proxied("mudfish-1") && p.is_proxied(TAG_AUTO));
         assert!(p.is_proxied("mudfish-9"), "a removed node behaves like auto");
         assert!(!p.is_proxied(TAG_DIRECT) && !p.is_proxied(TAG_REJECT));
+    }
+
+    /// Nodes saved before `custom` existed load as the Mudfish or WARP nodes they were (no schema
+    /// bump), and a node added by hand keeps its protocol across a save and load.
+    #[test]
+    fn custom_nodes_round_trip_and_older_nodes_keep_their_kind() {
+        let v3 = r#"{"schema_version": 3, "nodes": [
+          {"tag": "mudfish-1", "sid": 1, "name": "JP", "server": "1.1.1.1", "port": 18081, "country": "JP"},
+          {"tag": "warp-1", "name": "WARP", "server": "engage.cloudflareclient.com", "port": 2408, "country": "CF",
+           "wireguard": {"peer_public_key": "k", "address_v4": "172.16.0.2", "mtu": 1280}}]}"#;
+        let mut p: Profile = serde_json::from_str(v3).unwrap();
+        assert!(!p.migrate(), "the new field needs no conversion");
+        assert!(p.nodes[0].is_mudfish() && !p.nodes[0].is_custom() && !p.nodes[0].is_wireguard());
+        assert!(p.nodes[1].is_wireguard() && !p.nodes[1].is_mudfish() && !p.nodes[1].is_custom());
+
+        p.nodes.push(ProxyNode {
+            tag: "custom-1".into(),
+            sid: 0,
+            name: "Webshare".into(),
+            server: "198.51.100.7".into(),
+            port: 5092,
+            country: String::new(),
+            udp: false,
+            wireguard: None,
+            custom: Some(CustomProxy { protocol: ProxyProtocol::Http }),
+        });
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["nodes"][2]["custom"], serde_json::json!({ "protocol": "http" }));
+        assert!(json["nodes"][0].get("custom").is_none() && json["nodes"][1].get("custom").is_none(), "absent for the other kinds");
+        let back: Profile = serde_json::from_value(json).unwrap();
+        assert_eq!(back, p);
+        assert!(back.nodes[2].is_custom() && !back.nodes[2].is_mudfish() && !back.nodes[2].is_wireguard());
+        assert_eq!(serde_json::to_value(ProxyProtocol::Socks5).unwrap(), "socks5");
     }
 }

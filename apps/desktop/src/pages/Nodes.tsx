@@ -1,17 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, Cloud, Gauge, Loader2, Plus, RefreshCw, Search, Server, Trash2 } from "lucide-react";
-import { api, errorText, type NodeEntry } from "../lib/ipc";
+import { ArrowDown, ArrowUp, Cloud, Gauge, Link2, Loader2, Pencil, Plus, RefreshCw, Search, Server, Trash2 } from "lucide-react";
+import { api, errorText, type NodeEntry, type ProxyNode } from "../lib/ipc";
 import { useApp } from "../lib/store";
 import { countryName, latencyTone } from "../lib/format";
 import { Badge, Button, cx, EmptyState, IconButton, Input, Modal, PageHeader, Select } from "../components/ui";
+import { CustomNodeDialog } from "../components/CustomNodeDialog";
 
 type SortKey = "location" | "latency";
+
+/** Second line of an added node: its address, plus what sets it apart. */
+function nodeAddress(n: ProxyNode): string {
+  if (n.wireguard) return `${n.server}:${n.port} · ${n.wireguard.address_v4}`;
+  if (n.custom) return `${n.server.includes(":") ? `[${n.server}]` : n.server}:${n.port}${n.udp ? "" : " · 僅 TCP"}`;
+  return n.server;
+}
 
 export default function Nodes() {
   const { profile, core, updateProfile, toast } = useApp();
   const running = core.state === "running";
   const [creatingWarp, setCreatingWarp] = useState(false);
   const [confirmWarp, setConfirmWarp] = useState(false);
+  /** The custom-node dialog: `{}` adds one, `{ node }` edits it. */
+  const [customDialog, setCustomDialog] = useState<{ node?: ProxyNode } | null>(null);
   const [nodes, setNodes] = useState<NodeEntry[]>([]);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
@@ -253,9 +263,15 @@ export default function Nodes() {
             </Button>
             <p className="mt-1.5 text-[11px] leading-relaxed text-muted">每次產生都會註冊一個新的 Cloudflare WARP 免費裝置。金鑰存在 Windows 認證管理員；移除節點時會向 Cloudflare 註銷該裝置並刪除金鑰。</p>
           </div>
+          <div className="border-b border-border px-4 py-3">
+            <Button className="w-full" onClick={() => setCustomDialog({})} icon={<Link2 size={14} />} title="加入 HTTP 或 SOCKS5 代理（例如 Webshare），使用它自己的帳號密碼">
+              新增自訂節點
+            </Button>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-muted">HTTP 或 SOCKS5 代理，例如 Webshare。帳密存在 Windows 認證管理員；自訂節點不會加入「自動選擇」，要在群組或出口中直接選用。</p>
+          </div>
           {profile.nodes.length === 0 ? (
             <EmptyState icon={<Plus size={24} />} title="尚未加入節點">
-              從左側清單勾選 Mudfish 節點，或產生 WARP 節點。加入多個節點時，「自動選擇」會挑延遲最低的一個。
+              從左側清單勾選 Mudfish 節點、產生 WARP 節點，或新增自訂節點。加入多個 Mudfish 節點時，「自動選擇」會挑延遲最低的一個。
             </EmptyState>
           ) : (
             <ul className="min-h-0 flex-1 divide-y divide-border overflow-auto">
@@ -264,17 +280,27 @@ export default function Nodes() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span className="truncate" title={n.name}>{n.name}</span>
-                      {n.wireguard ? <Badge tone="warn">WARP</Badge> : <Badge>Mudfish</Badge>}
+                      {n.wireguard ? (
+                        <Badge tone="warn">WARP</Badge>
+                      ) : n.custom ? (
+                        <Badge tone="accent">{n.custom.protocol === "http" ? "HTTP" : "SOCKS5"}</Badge>
+                      ) : (
+                        <Badge>Mudfish</Badge>
+                      )}
                       {n.tag in proxyDelay && (
                         <Badge tone={latencyTone(proxyDelay[n.tag])}>{proxyDelay[n.tag] == null ? "逾時" : `${proxyDelay[n.tag]} ms`}</Badge>
                       )}
                     </div>
                     <div className="truncate font-mono text-[11px] text-muted" title={n.wireguard ? `${n.wireguard.address_v4} ${n.wireguard.address_v6}` : undefined}>
-                      {n.server}
-                      {n.wireguard ? `:${n.port} · ${n.wireguard.address_v4}` : ""}
+                      {nodeAddress(n)}
                     </div>
                   </div>
                   <div className="flex opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                    {n.custom && !n.wireguard && (
+                      <IconButton label="編輯" onClick={() => setCustomDialog({ node: n })}>
+                        <Pencil size={14} />
+                      </IconButton>
+                    )}
                     <IconButton label="上移" disabled={i === 0} onClick={() => move(n.tag, -1)}>
                       <ArrowUp size={14} />
                     </IconButton>
@@ -310,6 +336,7 @@ export default function Nodes() {
           </p>
         </Modal>
       )}
+      {customDialog && <CustomNodeDialog node={customDialog.node} onClose={() => setCustomDialog(null)} />}
     </div>
   );
 }

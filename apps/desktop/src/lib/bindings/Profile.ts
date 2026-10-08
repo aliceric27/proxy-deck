@@ -12,7 +12,8 @@ import type { TunSettings } from "./TunSettings";
  */
 export type Profile = { schema_version: number, 
 /**
- * Nodes the user picked from the Mudfish list; order is display order.
+ * Nodes the user picked from the Mudfish list, generated (WARP) or added by hand; order is
+ * display order.
  */
 nodes: Array<ProxyNode>, 
 /**

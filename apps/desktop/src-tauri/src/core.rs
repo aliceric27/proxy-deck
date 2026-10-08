@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use proxy_core::custom::ProxyAuth;
 use proxy_core::singbox::{self, GenerateOptions};
 use proxy_core::{Mode, Profile, Selections};
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,12 @@ pub fn build_plan(profile: &Profile, creds: Option<&Credentials>, paths: &Paths)
         .filter(|n| n.is_wireguard())
         .filter_map(|n| Some((n.tag.clone(), crate::credentials::load_warp(&n.tag)?.private_key)))
         .collect();
+    let proxy_auth: std::collections::BTreeMap<String, ProxyAuth> = profile
+        .nodes
+        .iter()
+        .filter(|n| n.is_custom())
+        .filter_map(|n| Some((n.tag.clone(), crate::credentials::load_proxy_auth(&n.tag)?)))
+        .collect();
     let self_exe = paths.self_exe.to_string_lossy();
     let config = singbox::generate(
         profile,
@@ -126,6 +133,7 @@ pub fn build_plan(profile: &Profile, creds: Option<&Credentials>, paths: &Paths)
             username: creds.map(|c| c.username.as_str()).unwrap_or_default(),
             password: creds.map(|c| c.password.as_str()).unwrap_or_default(),
             wireguard_keys: &wireguard_keys,
+            proxy_auth: &proxy_auth,
             ruleset_dir: &paths.ruleset_dir,
             clash_listen: &listen,
             clash_secret: &secret,

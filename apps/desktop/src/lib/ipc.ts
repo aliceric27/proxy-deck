@@ -5,12 +5,14 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AccountCheck } from "./bindings/AccountCheck";
 import type { ClashProxy } from "./bindings/ClashProxy";
 import type { CoreStatus } from "./bindings/CoreStatus";
+import type { CustomNodeInput } from "./bindings/CustomNodeInput";
 import type { LogBatch } from "./bindings/LogBatch";
 import type { NodeList } from "./bindings/NodeList";
 import type { PingResult } from "./bindings/PingResult";
 import type { ProcessInfo } from "./bindings/ProcessInfo";
 import type { Profile } from "./bindings/Profile";
 import type { ProfileState } from "./bindings/ProfileState";
+import type { ProxyLink } from "./bindings/ProxyLink";
 import type { ProxyNode } from "./bindings/ProxyNode";
 import type { RuleGroup } from "./bindings/RuleGroup";
 import type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
@@ -21,6 +23,8 @@ export type { AccountCheck } from "./bindings/AccountCheck";
 export type { ClashProxy } from "./bindings/ClashProxy";
 export type { Connection } from "./bindings/Connection";
 export type { CoreStatus } from "./bindings/CoreStatus";
+export type { CustomNodeInput } from "./bindings/CustomNodeInput";
+export type { CustomProxy } from "./bindings/CustomProxy";
 export type { GeoIpGroup } from "./bindings/GeoIpGroup";
 export type { LogBatch } from "./bindings/LogBatch";
 export type { LogLevel } from "./bindings/LogLevel";
@@ -30,7 +34,9 @@ export type { NodeEntry } from "./bindings/NodeEntry";
 export type { ProcessInfo } from "./bindings/ProcessInfo";
 export type { Profile } from "./bindings/Profile";
 export type { ProfileState } from "./bindings/ProfileState";
+export type { ProxyLink } from "./bindings/ProxyLink";
 export type { ProxyNode } from "./bindings/ProxyNode";
+export type { ProxyProtocol } from "./bindings/ProxyProtocol";
 export type { RuleGroup } from "./bindings/RuleGroup";
 export type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
 export type { Snapshot } from "./bindings/Snapshot";
@@ -56,6 +62,14 @@ export const api = {
   warpCreate: () => invoke<ProxyNode>("warp_create"),
   /** Unregisters a just-created WARP device whose node could not be saved. */
   warpDiscard: (tag: string) => invoke<void>("warp_discard", { tag }),
+  /** Splits a pasted proxy link into its parts; nothing is stored. */
+  parseProxyLink: (text: string) => invoke<ProxyLink>("parse_proxy_link", { text }),
+  /** Validates a hand-added HTTP/SOCKS5 node (`tag` null: a new one) and returns it to save through `saveProfile`; stores nothing. */
+  customNodeBuild: (tag: string | null, input: CustomNodeInput) => invoke<ProxyNode>("custom_node_build", { tag, input }),
+  /** After the save: stores the node's account, only if the profile now holds exactly the node built from `input`. */
+  customNodeStoreAuth: (tag: string, input: CustomNodeInput) => invoke<void>("custom_node_store_auth", { tag, input }),
+  /** The stored username of a hand-added node (`null`: no readable account); the password never leaves the backend. */
+  customNodeUsername: (tag: string) => invoke<string | null>("custom_node_username", { tag }),
   ping: (ips: string[]) => invoke<PingResult[]>("ping_nodes", { ips }),
   start: () => invoke<void>("core_start"),
   stop: () => invoke<void>("core_stop"),

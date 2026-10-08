@@ -9,6 +9,7 @@ import {
   geoipLabel,
   geoipSummary,
   isProxied,
+  isTcpOnlyNode,
   MATCHER_META,
   MatcherSummary,
   matcherCounts,
@@ -349,7 +350,14 @@ function GroupEditor({ group: g, fresh, onChange, onDelete, onClose }: { group: 
           <OutboundSelect profile={profile} value={g.outbound} onChange={(outbound) => onChange({ outbound })} className="w-full" />
         </Field>
         {isProxied(profile, g.outbound) && (
-          <Field label="UDP 流量" hint="遊戲通常使用 UDP。">
+          <Field
+            label="UDP 流量"
+            hint={
+              isTcpOnlyNode(profile, g.outbound) && g.udp === "follow"
+                ? "這個節點只轉送 TCP，選「一起走代理」時 UDP 連線會失敗。遊戲請改成「UDP 直連」或「阻擋 UDP」。"
+                : "遊戲通常使用 UDP。"
+            }
+          >
             <Select<UdpPolicy>
               label="UDP 流量"
               value={g.udp}

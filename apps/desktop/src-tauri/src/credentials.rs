@@ -1,6 +1,8 @@
 //! Mudfish account (ID + password) in Windows Credential Manager. These are the account
-//! credentials themselves, so they never touch profile.json or the logs.
+//! credentials themselves, so they never touch profile.json or the logs. Per-node secrets
+//! (WARP keys, the accounts of hand-added proxies) live there too, one entry per node tag.
 
+use proxy_core::custom::ProxyAuth;
 use serde::{Deserialize, Serialize};
 
 const SERVICE: &str = "ProxyDesk";
@@ -52,6 +54,16 @@ pub fn load_warp(tag: &str) -> Option<WarpSecret> {
 pub fn store_warp(tag: &str, secret: &WarpSecret) -> Result<(), String> {
     let s = serde_json::to_string(secret).map_err(|e| e.to_string())?;
     node_entry(tag)?.set_password(&s).map_err(|e| format!("儲存 WARP 金鑰失敗: {e}"))
+}
+
+/// Account of a hand-added HTTP/SOCKS5 node.
+pub fn load_proxy_auth(tag: &str) -> Option<ProxyAuth> {
+    serde_json::from_str(&node_entry(tag).ok()?.get_password().ok()?).ok()
+}
+
+pub fn store_proxy_auth(tag: &str, auth: &ProxyAuth) -> Result<(), String> {
+    let s = serde_json::to_string(auth).map_err(|e| e.to_string())?;
+    node_entry(tag)?.set_password(&s).map_err(|e| format!("儲存節點帳密失敗: {e}"))
 }
 
 pub fn delete_node_secret(tag: &str) {

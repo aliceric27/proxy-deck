@@ -2,6 +2,8 @@
 
 Windows 桌面代理客戶端：從 Mudfish 取得 SOCKS5 節點，用 sing-box 的 TUN 模式讓**指定的應用程式或網域**走代理，其餘流量依 GeoIP 與 final 處理（預設直連）。
 
+除了 Mudfish 節點，也可以產生 Cloudflare WARP 節點，或手動加入其他供應商的 HTTP / SOCKS5 代理（例如 Webshare，可直接貼上 `http://帳號:密碼@主機:連接埠`）。手動加入的節點不會參與「自動選擇」，要在群組或出口中直接選用。
+
 分流由上而下比對：自訂群組 → GeoIP → final。
 
 - **自訂群組**：一個群組可以同時包含程式、網域、規則集與 IP 範圍，各自指定出口（直接連線、阻擋、自動選擇或某個節點），並依優先順序比對。
@@ -43,7 +45,7 @@ M0 驗證環境：`docker/m0/`（Linux 容器，見該目錄 README）與 `docs/
 ## 專案結構
 
 ```
-crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、Profile → sing-box JSON（純邏輯，有單元測試）
+crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、手動節點（連結解析）、Profile → sing-box JSON（純邏輯，有單元測試）
 apps/desktop/src-tauri/   Tauri 後端：sing-box 子程序管理、Clash API client、認證管理員、系統匣
 apps/desktop/src/         React 前端：總覽、節點、分流群組、連線、日誌、設定
 docker/m0/                M0 Docker 驗證環境
@@ -57,6 +59,7 @@ docs/                     PLAN.md 與 M0 驗證腳本
 | Mudfish 帳密 | Windows 認證管理員（`ProxyDesk` / `mudfish-account`） |
 | 設定（不含密碼）、節點清單快取 | `%APPDATA%\tw.proxydesk.desktop\` |
 | WARP 私鑰與裝置 token | Windows 認證管理員（`ProxyDesk` / `node-<tag>`） |
+| 手動加入節點的帳號密碼 | Windows 認證管理員（`ProxyDesk` / `node-<tag>`）；移除節點時一併刪除 |
 | sing-box 工作目錄（cache.db），只有系統管理員能寫入。產生的設定（含帳密）經 stdin 傳給 sing-box，不寫入磁碟 | `%ProgramData%\ProxyDesk\run\` |
 
 升級設定檔格式時，原檔會先備份在同一個資料夾，檔名為 `profile.v<舊版本>-backup.json`（已存在就不覆蓋）。升級後流量維持原樣，只有兩處小差異：

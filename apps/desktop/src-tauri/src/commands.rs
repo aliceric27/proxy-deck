@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use proxy_core::custom::{self, CustomNodeInput, ProxyLink};
 use proxy_core::singbox::restart_fingerprint;
 use proxy_core::{Profile, ProxyNode};
 use serde::Serialize;
@@ -68,21 +69,22 @@ pub async fn get_snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
 /// running core, and reports what still needs a reconnect.
 #[tauri::command]
 pub async fn save_profile(state: State<'_, AppState>, profile: Profile) -> CmdResult<ProfileState> {
-    let removed_warp: Vec<String> = {
+    let removed: Vec<ProxyNode> = {
         let mut current = state.profile.write().await;
         crate::store::save(&state.paths.profile_file(), &profile)?;
-        let removed = current
-            .nodes
-            .iter()
-            .filter(|n| n.is_wireguard() && profile.node(&n.tag).is_none())
-            .map(|n| n.tag.clone())
-            .collect();
+        let removed = current.nodes.iter().filter(|n| profile.node(&n.tag).is_none()).cloned().collect();
         *current = profile.clone();
         removed
     };
-    for tag in removed_warp {
-        let http = state.http.clone();
-        tauri::async_runtime::spawn(async move { crate::warp::deregister(&http, &tag).await });
+    // A removed node takes its secrets along: a WARP device is unregistered, a hand-added
+    // node's account is forgotten.
+    for n in removed {
+        if n.is_wireguard() {
+            let http = state.http.clone();
+            tauri::async_runtime::spawn(async move { crate::warp::deregister(&http, &n.tag).await });
+        } else if n.is_custom() {
+            credentials::delete_node_secret(&n.tag);
+        }
     }
     state.core.set_selections(profile.selections()).await.map_err(|e| format!("設定已儲存，但無法即時套用：{e}"))?;
     Ok(profile_state(&state, &profile).await)
@@ -103,6 +105,55 @@ pub async fn warp_discard(state: State<'_, AppState>, tag: String) -> CmdResult<
         crate::warp::deregister(&state.http, &tag).await;
     }
     Ok(())
+}
+
+/// Splits a pasted proxy link (`http://user:pass@host:port`, `socks5://…`, a `host:port:user:pass`
+/// line of a Webshare list) for the add dialog to fill in.
+#[tauri::command]
+pub async fn parse_proxy_link(text: String) -> CmdResult<ProxyLink> {
+    custom::parse_proxy_link(&text)
+}
+
+/// Validates a hand-added HTTP/SOCKS5 node and returns it: a new node under a fresh tag (no `tag`)
+/// or the edit of an existing one. Nothing is stored: the caller saves the node through
+/// `save_profile` first and then hands the same input to `custom_node_store_auth`.
+#[tauri::command]
+pub async fn custom_node_build(state: State<'_, AppState>, tag: Option<String>, input: CustomNodeInput) -> CmdResult<ProxyNode> {
+    let profile = state.profile.read().await;
+    let tag = match tag {
+        Some(tag) if profile.node(&tag).is_some_and(ProxyNode::is_custom) => tag,
+        Some(_) => return Err("找不到這個自訂節點，可能已經被移除".into()),
+        None => loop {
+            let tag = format!("custom-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            if profile.node(&tag).is_none() {
+                break tag;
+            }
+        },
+    };
+    // The password does not shape the node; this only checks it against the username.
+    input.into_node(tag, None).map(|(node, _)| node)
+}
+
+/// Stores the account of a hand-added node, once the profile holds exactly the node built from
+/// this input: after a failed profile save the stored account keeps matching the server the profile
+/// still has (and a new node that was never saved gets none). A `None` password keeps the stored one.
+#[tauri::command]
+pub async fn custom_node_store_auth(state: State<'_, AppState>, tag: String, input: CustomNodeInput) -> CmdResult<()> {
+    // Held until the account is written: a save that removes the node meanwhile waits, then deletes it.
+    let profile = state.profile.read().await;
+    let auth = input.account_for_saved(tag.clone(), profile.node(&tag), credentials::load_proxy_auth(&tag))?;
+    credentials::store_proxy_auth(&tag, &auth)
+}
+
+/// The stored username of a hand-added node, for the edit dialog: empty for a node without
+/// authentication, `None` when Credential Manager has no readable account for it. The password
+/// never leaves Credential Manager.
+#[tauri::command]
+pub async fn custom_node_username(state: State<'_, AppState>, tag: String) -> CmdResult<Option<String>> {
+    if !state.profile.read().await.node(&tag).is_some_and(ProxyNode::is_custom) {
+        return Ok(None);
+    }
+    Ok(credentials::load_proxy_auth(&tag).map(|a| a.username))
 }
 
 #[tauri::command]

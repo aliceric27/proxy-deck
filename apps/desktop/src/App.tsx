@@ -148,7 +148,7 @@ function Banners({ onNavigate }: { onNavigate: (p: PageId) => void }) {
   if (!snapshot.sing_box_found) items.push({ text: "找不到 sing-box.exe，請重新安裝 ProxyDesk。" });
   const nodes = snapshot.profile.nodes;
   if (nodes.length === 0) items.push({ text: "尚未加入任何節點。", action: { label: "選擇節點", page: "nodes" } });
-  else if (!snapshot.username && nodes.some((n) => !n.wireguard)) items.push({ text: "已加入 Mudfish 節點，但尚未設定 Mudfish 帳號。", action: { label: "前往設定", page: "settings" } });
+  else if (!snapshot.username && nodes.some((n) => !n.wireguard && !n.custom)) items.push({ text: "已加入 Mudfish 節點，但尚未設定 Mudfish 帳號。", action: { label: "前往設定", page: "settings" } });
   if (!items.length) return null;
   return (
     <div className="border-b border-border bg-warn-soft">

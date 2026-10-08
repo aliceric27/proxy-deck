@@ -131,6 +131,9 @@ export function effectiveGlobal(profile: Profile): string {
 /** Mirrors `Profile::is_proxied`: traffic leaves through a node, i.e. it is neither direct nor blocked. */
 export const isProxied = (profile: Profile, outbound: string) => !["direct", "reject"].includes(effectiveOutbound(profile, outbound));
 
+/** The outbound is a node that forwards TCP only (an HTTP proxy, or UDP turned off); `auto` counts as no. */
+export const isTcpOnlyNode = (profile: Profile, outbound: string) => profile.nodes.find((n) => n.tag === effectiveOutbound(profile, outbound))?.udp === false;
+
 /** Display name for a resolved outbound tag (a node, `direct`, …). */
 export function nodeDisplayName(profile: Profile, tag: string | undefined): string | undefined {
   if (!tag) return undefined;

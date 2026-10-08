@@ -154,6 +154,7 @@ pub async fn create(http: &reqwest::Client, sing_box: &std::path::Path, index: u
             reserved: reserved_bytes(&reg.config.client_id),
             mtu: WARP_MTU,
         }),
+        custom: None,
     })
 }
 

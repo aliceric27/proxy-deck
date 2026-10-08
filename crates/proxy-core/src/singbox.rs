@@ -15,15 +15,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
+use crate::custom::ProxyAuth;
 use crate::model::*;
 
 /// Runtime inputs that are not part of the persisted profile.
 pub struct GenerateOptions<'a> {
-    /// Mudfish account; only required when the profile has SOCKS (Mudfish) nodes.
+    /// Mudfish account; only required when the profile has Mudfish nodes.
     pub username: &'a str,
     pub password: &'a str,
     /// WireGuard private keys by node tag (kept in the OS credential store, not the profile).
     pub wireguard_keys: &'a BTreeMap<String, String>,
+    /// Accounts of the hand-added HTTP/SOCKS5 nodes by tag (kept in the OS credential store, not
+    /// the profile). Every such node needs an entry; an empty username means no authentication.
+    pub proxy_auth: &'a BTreeMap<String, ProxyAuth>,
     /// Directory containing `geosite/`, `geoip/` and `acl/` `.srs` files.
     pub ruleset_dir: &'a Path,
     /// `127.0.0.1:<port>`
@@ -46,6 +50,8 @@ pub enum GenerateError {
     NoCredentials,
     #[error("找不到節點「{0}」的 WireGuard 金鑰，請刪除後重新產生")]
     MissingWireguardKey(String),
+    #[error("找不到節點「{0}」的帳號密碼，請在節點頁編輯這個節點並重新輸入")]
+    MissingProxyAuth(String),
     #[error("群組「{0}」沒有任何比對條件")]
     EmptyGroup(String),
     #[error("規則集代碼格式錯誤：{0}（應為 geosite:xxx、geoip:xx 或 acl:xxx）")]
@@ -62,11 +68,14 @@ pub fn generate(profile: &Profile, opts: &GenerateOptions) -> Result<Value, Gene
     if profile.nodes.is_empty() {
         return Err(GenerateError::NoNodes);
     }
-    if profile.nodes.iter().any(|n| !n.is_wireguard()) && (opts.username.is_empty() || opts.password.is_empty()) {
+    if profile.nodes.iter().any(ProxyNode::is_mudfish) && (opts.username.is_empty() || opts.password.is_empty()) {
         return Err(GenerateError::NoCredentials);
     }
     if let Some(n) = profile.nodes.iter().find(|n| n.is_wireguard() && !opts.wireguard_keys.contains_key(&n.tag)) {
         return Err(GenerateError::MissingWireguardKey(n.name.clone()));
+    }
+    if let Some(n) = profile.nodes.iter().find(|n| n.is_custom() && !opts.proxy_auth.contains_key(&n.tag)) {
+        return Err(GenerateError::MissingProxyAuth(n.name.clone()));
     }
 
     let groups: Vec<&RuleGroup> = profile.groups.iter().filter(|g| g.enabled).collect();
@@ -97,14 +106,18 @@ pub fn generate(profile: &Profile, opts: &GenerateOptions) -> Result<Value, Gene
 /// Everything in the generated config that only takes effect when the core restarts. Two
 /// profiles with the same fingerprint differ at most in their `Selections` (what each selector
 /// is switched to, and the mode), which the running core applies live through the Clash API.
+/// Secrets are placeholders here, so a changed account or key never shows up in it.
 /// `Err` carries why the profile cannot become a config at all.
 pub fn restart_fingerprint(profile: &Profile, ruleset_dir: &Path) -> Result<String, String> {
     let keys: BTreeMap<String, String> =
         profile.nodes.iter().filter(|n| n.is_wireguard()).map(|n| (n.tag.clone(), String::new())).collect();
+    let auth: BTreeMap<String, ProxyAuth> =
+        profile.nodes.iter().filter(|n| n.is_custom()).map(|n| (n.tag.clone(), ProxyAuth::default())).collect();
     let opts = GenerateOptions {
         username: "-",
         password: "-",
         wireguard_keys: &keys,
+        proxy_auth: &auth,
         ruleset_dir,
         clash_listen: "",
         clash_secret: "",
@@ -352,17 +365,25 @@ fn tun(t: &TunSettings) -> Value {
     })
 }
 
+/// The nodes `auto` picks from: the Mudfish nodes, or else the WARP nodes, or else the
+/// hand-added ones. The other kinds are only ever chosen explicitly:
+/// - WARP lands on a nearby Cloudflare edge, so its latency nearly always wins; letting `auto`
+///   pick it would silently pull region-targeted traffic off Mudfish.
+/// - A hand-added proxy is often TCP-only (HTTP, or a provider without UDP, like Webshare), so
+///   `auto` landing on one would break the UDP of everything that follows `auto`.
+fn auto_members(profile: &Profile) -> Vec<&str> {
+    let tags = move |kind: fn(&ProxyNode) -> bool| profile.nodes.iter().filter(|n| kind(n)).map(|n| n.tag.as_str()).collect::<Vec<_>>();
+    [tags(ProxyNode::is_mudfish), tags(ProxyNode::is_wireguard), tags(ProxyNode::is_custom)]
+        .into_iter()
+        .find(|members| !members.is_empty())
+        .unwrap_or_default()
+}
+
 fn outbounds(profile: &Profile, opts: &GenerateOptions) -> Value {
     let node_tags: Vec<&str> = profile.nodes.iter().map(|n| n.tag.as_str()).collect();
-    // WARP lands on a nearby Cloudflare edge, so its latency nearly always wins; letting
-    // `auto` pick it would silently pull region-targeted traffic off Mudfish. WARP joins
-    // `auto` only when there are no Mudfish nodes, and is otherwise chosen explicitly.
-    let mudfish: Vec<&str> = profile.nodes.iter().filter(|n| !n.is_wireguard()).map(|n| n.tag.as_str()).collect();
-    let auto_members = if mudfish.is_empty() { node_tags.clone() } else { mudfish };
-
     let mut out = vec![json!({
         "type": "urltest", "tag": TAG_AUTO,
-        "outbounds": auto_members,
+        "outbounds": auto_members(profile),
         "url": "https://www.gstatic.com/generate_204",
         "interval": "5m", "tolerance": 50, "idle_timeout": "30m",
     })];
@@ -383,19 +404,31 @@ fn outbounds(profile: &Profile, opts: &GenerateOptions) -> Value {
         }));
     }
 
-    for n in profile.nodes.iter().filter(|n| !n.is_wireguard()) {
-        let mut o = json!({
-            "type": "socks", "tag": n.tag,
-            "server": n.server, "server_port": n.port, "version": "5",
-            "username": opts.username, "password": opts.password,
-        });
-        if !n.udp {
-            o["network"] = json!("tcp");
-        }
-        out.push(o);
-    }
+    out.extend(profile.nodes.iter().filter(|n| !n.is_wireguard()).map(|n| proxy_outbound(n, opts)));
     out.push(json!({ "type": "direct", "tag": TAG_DIRECT }));
     Value::Array(out)
+}
+
+/// A SOCKS5 or HTTP outbound. Mudfish nodes sign in with the Mudfish account, hand-added nodes
+/// with their own (none when its username is empty).
+fn proxy_outbound(n: &ProxyNode, opts: &GenerateOptions) -> Value {
+    let (protocol, auth) = match &n.custom {
+        Some(c) => (c.protocol, opts.proxy_auth.get(&n.tag).filter(|a| !a.username.is_empty()).map(|a| (a.username.as_str(), a.password.as_str()))),
+        None => (ProxyProtocol::Socks5, Some((opts.username, opts.password))),
+    };
+    let mut o = match protocol {
+        ProxyProtocol::Socks5 => json!({ "type": "socks", "tag": n.tag, "server": n.server, "server_port": n.port, "version": "5" }),
+        ProxyProtocol::Http => json!({ "type": "http", "tag": n.tag, "server": n.server, "server_port": n.port }),
+    };
+    if let Some((username, password)) = auth {
+        o["username"] = json!(username);
+        o["password"] = json!(password);
+    }
+    // An HTTP proxy only tunnels TCP; sing-box's HTTP outbound has no `network` option at all.
+    if protocol == ProxyProtocol::Socks5 && !n.udp {
+        o["network"] = json!("tcp");
+    }
+    o
 }
 
 /// WARP nodes as WireGuard endpoints (1.11+ replaced the WireGuard outbound). Endpoints are
@@ -596,7 +629,30 @@ mod tests {
             country: "TW".into(),
             udp: true,
             wireguard: None,
+            custom: None,
         }
+    }
+
+    /// A hand-added node; its account goes into `GenerateOptions::proxy_auth` separately.
+    fn custom_node(tag: &str, protocol: ProxyProtocol, udp: bool) -> ProxyNode {
+        ProxyNode {
+            tag: tag.into(),
+            sid: 0,
+            name: format!("custom {tag}"),
+            server: "198.51.100.7".into(),
+            port: 5092,
+            country: String::new(),
+            udp,
+            wireguard: None,
+            custom: Some(CustomProxy { protocol }),
+        }
+    }
+
+    fn auth(entries: &[(&str, &str, &str)]) -> BTreeMap<String, ProxyAuth> {
+        entries
+            .iter()
+            .map(|(tag, username, password)| (tag.to_string(), ProxyAuth { username: username.to_string(), password: password.to_string() }))
+            .collect()
     }
 
     fn warp_node() -> ProxyNode {
@@ -615,10 +671,12 @@ mod tests {
                 reserved: vec![1, 2, 3],
                 mtu: 1280,
             }),
+            custom: None,
         }
     }
 
     static NO_KEYS: BTreeMap<String, String> = BTreeMap::new();
+    static NO_AUTH: BTreeMap<String, ProxyAuth> = BTreeMap::new();
 
     fn warp_keys() -> BTreeMap<String, String> {
         // any valid base64 32-byte key works for `sing-box check`
@@ -634,6 +692,7 @@ mod tests {
             username: "user",
             password: "pass",
             wireguard_keys: &NO_KEYS,
+            proxy_auth: &NO_AUTH,
             ruleset_dir: dir,
             clash_listen: "127.0.0.1:19090",
             clash_secret: "secret",
@@ -1298,6 +1357,114 @@ mod tests {
     }
 
     #[test]
+    fn hand_added_nodes_become_http_and_socks_outbounds_with_their_own_accounts() {
+        let dir = ruleset_dir();
+        let mut p = sample_profile();
+        p.nodes.extend([
+            custom_node("custom-http", ProxyProtocol::Http, true), // `udp` on an HTTP node (a hand edit) changes nothing
+            custom_node("custom-socks", ProxyProtocol::Socks5, false),
+            custom_node("custom-udp", ProxyProtocol::Socks5, true),
+            custom_node("custom-open", ProxyProtocol::Http, false),
+        ]);
+        p.groups[2].outbound = "custom-http".into();
+        let accounts = auth(&[("custom-http", "tslv", "secret"), ("custom-socks", "u", "p"), ("custom-udp", "u2", "p2"), ("custom-open", "", "")]);
+        let mut o = opts(&dir);
+        o.proxy_auth = &accounts;
+        let c = generate(&p, &o).unwrap();
+
+        assert_eq!(
+            find_outbound(&c, "custom-http"),
+            &json!({ "type": "http", "tag": "custom-http", "server": "198.51.100.7", "server_port": 5092, "username": "tslv", "password": "secret" }),
+            "no `version`, and no `network`: the HTTP outbound has neither"
+        );
+        assert_eq!(
+            find_outbound(&c, "custom-socks"),
+            &json!({ "type": "socks", "tag": "custom-socks", "server": "198.51.100.7", "server_port": 5092, "version": "5",
+                     "username": "u", "password": "p", "network": "tcp" })
+        );
+        assert!(find_outbound(&c, "custom-udp").get("network").is_none(), "UDP allowed");
+        assert_eq!(
+            find_outbound(&c, "custom-open"),
+            &json!({ "type": "http", "tag": "custom-open", "server": "198.51.100.7", "server_port": 5092 }),
+            "no username: no authentication"
+        );
+        let mudfish = find_outbound(&c, "mudfish-591");
+        assert_eq!((mudfish["username"].as_str(), mudfish["password"].as_str()), (Some("user"), Some("pass")), "Mudfish nodes keep the Mudfish account");
+
+        // Selectable everywhere, but `auto` keeps to the Mudfish nodes.
+        for tag in ["final", "geoip", "global", "group-game"] {
+            let members = find_outbound(&c, tag)["outbounds"].as_array().unwrap();
+            assert!(["custom-http", "custom-socks", "custom-udp", "custom-open"].iter().all(|t| members.contains(&json!(t))), "{tag}");
+        }
+        assert_eq!(find_outbound(&c, "group-site")["default"], "custom-http");
+        assert_eq!(find_outbound(&c, "auto")["outbounds"], json!(["mudfish-591", "mudfish-655"]));
+    }
+
+    /// `auto` takes the hand-added nodes only when there is nothing else, rather than having no member.
+    #[test]
+    fn auto_picks_hand_added_nodes_only_without_other_nodes() {
+        let dir = ruleset_dir();
+        let keys = warp_keys();
+        let accounts = auth(&[("custom-1", "u", "p"), ("custom-2", "u", "p")]);
+        let mut o = opts(&dir);
+        o.wireguard_keys = &keys;
+        o.proxy_auth = &accounts;
+        let auto = |extra: Option<ProxyNode>| {
+            let mut nodes = vec![custom_node("custom-1", ProxyProtocol::Http, false), custom_node("custom-2", ProxyProtocol::Socks5, false)];
+            nodes.extend(extra);
+            let c = generate(&Profile { nodes, ..Profile::default() }, &o).unwrap();
+            find_outbound(&c, "auto")["outbounds"].clone()
+        };
+        assert_eq!(auto(Some(node(591))), json!(["mudfish-591"]));
+        assert_eq!(auto(Some(warp_node())), json!(["warp-test"]), "WARP comes before hand-added nodes");
+        assert_eq!(auto(None), json!(["custom-1", "custom-2"]));
+    }
+
+    #[test]
+    fn hand_added_nodes_need_their_own_account_entry_not_the_mudfish_account() {
+        let dir = ruleset_dir();
+        let p = Profile { nodes: vec![custom_node("custom-1", ProxyProtocol::Http, false)], ..Profile::default() };
+        let mut o = opts(&dir);
+        o.username = "";
+        o.password = "";
+        assert_eq!(generate(&p, &o), Err(GenerateError::MissingProxyAuth("custom custom-1".into())));
+
+        let accounts = auth(&[("custom-1", "u", "p")]);
+        o.proxy_auth = &accounts;
+        assert!(generate(&p, &o).is_ok(), "no Mudfish account needed");
+
+        let mut mixed = p.clone();
+        mixed.nodes.push(node(591));
+        assert_eq!(generate(&mixed, &o), Err(GenerateError::NoCredentials), "a Mudfish node next to it still needs one");
+    }
+
+    /// The server of a hand-added node is part of the config, its account is not (placeholders,
+    /// like every other secret): a changed password applies on the next connect without a prompt.
+    #[test]
+    fn fingerprint_sees_hand_added_servers_but_not_their_accounts() {
+        let dir = ruleset_dir();
+        let mut p = sample_profile();
+        let base = restart_fingerprint(&p, &dir);
+        p.nodes.push(custom_node("custom-1", ProxyProtocol::Http, false));
+        let with_node = restart_fingerprint(&p, &dir);
+        assert!(with_node.is_ok(), "no account is needed for the fingerprint");
+        assert_ne!(with_node, base, "a new node is a new outbound");
+
+        for change in [
+            |n: &mut ProxyNode| n.port = 8080,
+            |n: &mut ProxyNode| n.server = "203.0.113.9".into(),
+            |n: &mut ProxyNode| n.custom = Some(CustomProxy { protocol: ProxyProtocol::Socks5 }),
+        ] {
+            let mut changed = p.clone();
+            change(changed.nodes.last_mut().unwrap());
+            assert_ne!(restart_fingerprint(&changed, &dir), with_node);
+        }
+        let mut renamed = p.clone();
+        renamed.nodes.last_mut().unwrap().name = "renamed".into();
+        assert_eq!(restart_fingerprint(&renamed, &dir), with_node, "the name is not in the config");
+    }
+
+    #[test]
     fn blocked_final_adds_a_catch_all_instead_of_a_selector() {
         let mut p = sample_profile();
         p.final_outbound = TAG_REJECT.into();
@@ -1326,10 +1493,22 @@ mod tests {
         acl.process_names = vec!["steam.exe".into()];
         acl.udp = UdpPolicy::Reject;
         p.groups.push(acl);
+        // Hand-added nodes of both protocols, with and without an account, one of them a group's outbound.
+        let mut web = RuleGroup::new("web", "web", "custom-http");
+        web.domain_suffixes = vec!["example.org".into()];
+        p.groups.push(web);
         p.nodes.push(warp_node());
+        p.nodes.extend([
+            custom_node("custom-http", ProxyProtocol::Http, false),
+            custom_node("custom-socks", ProxyProtocol::Socks5, false),
+            custom_node("custom-udp", ProxyProtocol::Socks5, true),
+            custom_node("custom-open", ProxyProtocol::Http, false),
+        ]);
         let keys = warp_keys();
+        let accounts = auth(&[("custom-http", "tslv", "secret"), ("custom-socks", "u", "p"), ("custom-udp", "u2", "p2"), ("custom-open", "", "")]);
         let mut o = opts(&dir);
         o.wireguard_keys = &keys;
+        o.proxy_auth = &accounts;
         o.self_exe = Some(r"C:\Program Files\ProxyDesk\proxydesk.exe");
         // AND groups with app + domain + IP, one of them with a UDP policy of its own: the logical
         // `and`, and the UDP guard wrapped around it, must pass the real validator too.
@@ -1351,6 +1530,7 @@ mod tests {
             (true, TAG_AUTO, TAG_REJECT, vec!["tw"], false),
             (true, TAG_DIRECT, TAG_DIRECT, vec![], false),
             (true, TAG_DIRECT, TAG_AUTO, vec!["tw"], true),
+            (false, "custom-socks", "custom-open", vec!["tw"], false),
         ];
         for (i, (fakeip, final_outbound, geoip_outbound, countries, with_and)) in cases.into_iter().enumerate() {
             p.dns.fakeip = fakeip;
