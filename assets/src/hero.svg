@@ -1,0 +1,236 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">ProxyDesk</title>
+  <desc id="desc">ProxyDesk, a split-tunnel proxy client for Windows: some apps are routed through a proxy node, the rest connect directly.</desc>
+  <defs>
+    <clipPath id="frame"><rect width="1280" height="640" rx="28"/></clipPath>
+
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c2127"/>
+      <stop offset="0.55" stop-color="#0b161e"/>
+      <stop offset="1" stop-color="#0a1018"/>
+    </linearGradient>
+    <radialGradient id="glow-hub" cx="872" cy="320" r="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2fb0ba" stop-opacity="0.28"/>
+      <stop offset="0.45" stop-color="#2fb0ba" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#2fb0ba" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-corner" cx="120" cy="40" r="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3987e5" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#3987e5" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="12" cy="12" r="1.1" fill="#ffffff"/>
+    </pattern>
+    <radialGradient id="dots-fade" cx="900" cy="320" r="520" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.09"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="dots-mask"><rect width="1280" height="640" fill="url(#dots-fade)"/></mask>
+
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4fc9d2"/>
+      <stop offset="1" stop-color="#0b6a73"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.4"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.09"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="title-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#cfe6ea"/>
+    </linearGradient>
+
+    <linearGradient id="in-proxy" x1="694" y1="0" x2="808" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4a95ee"/>
+      <stop offset="1" stop-color="#3cb4be"/>
+    </linearGradient>
+    <linearGradient id="in-direct" x1="694" y1="0" x2="808" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22b67f"/>
+      <stop offset="1" stop-color="#3cb4be"/>
+    </linearGradient>
+    <linearGradient id="out-proxy" x1="936" y1="0" x2="1040" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3cb4be"/>
+      <stop offset="1" stop-color="#4a95ee"/>
+    </linearGradient>
+    <linearGradient id="out-direct" x1="936" y1="0" x2="1040" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3cb4be"/>
+      <stop offset="1" stop-color="#22b67f"/>
+    </linearGradient>
+
+    <filter id="hub-shadow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="18" result="blur"/>
+      <feOffset in="blur" dy="12" result="offset"/>
+      <feFlood flood-color="#02161a" flood-opacity="0.7" result="color"/>
+      <feComposite in="color" in2="offset" operator="in" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+
+    <!-- Split mark: one stream in, out through a node (filled) or direct (ring). 64 × 64. -->
+    <g id="split">
+      <g fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round">
+        <path d="M12 32H24C32 32 34 20 40.5 20"/>
+        <path d="M24 32C32 32 34 44 40.5 44"/>
+      </g>
+      <circle cx="47" cy="20" r="5.5" fill="#ffffff"/>
+      <circle cx="47" cy="44" r="4.5" fill="none" stroke="#ffffff" stroke-width="3"/>
+    </g>
+
+    <!-- App glyphs, 24 × 24, stroked. -->
+    <g id="i-game">
+      <path d="M7 8h10a5 5 0 0 1 4.9 4l.9 4.3a2.6 2.6 0 0 1-4.6 2.1L16.5 16h-9l-1.7 2.4a2.6 2.6 0 0 1-4.6-2.1l.9-4.3A5 5 0 0 1 7 8z"/>
+      <path d="M7.5 10.6v3.4M5.8 12.3h3.4"/>
+      <circle cx="15.6" cy="11.4" r="0.6" fill="currentColor"/>
+      <circle cx="17.6" cy="13.3" r="0.6" fill="currentColor"/>
+    </g>
+    <g id="i-chat">
+      <path d="M5 4.5h14a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-8l-4.5 3.5V17H5a2 2 0 0 1-2-2V6.5a2 2 0 0 1 2-2z"/>
+      <circle cx="8" cy="10.8" r="0.5" fill="currentColor"/>
+      <circle cx="12" cy="10.8" r="0.5" fill="currentColor"/>
+      <circle cx="16" cy="10.8" r="0.5" fill="currentColor"/>
+    </g>
+    <g id="i-browser">
+      <rect x="3" y="4" width="18" height="16" rx="2.5"/>
+      <path d="M3 8.5h18"/>
+      <circle cx="12" cy="14.3" r="3.3"/>
+      <path d="M8.7 14.3h6.6M12 11c1.1 1 1.1 5.6 0 6.6"/>
+    </g>
+    <g id="i-terminal">
+      <rect x="3" y="4" width="18" height="16" rx="2.5"/>
+      <path d="M7 9.5l3 2.6-3 2.6M12.5 15h4.5"/>
+    </g>
+  </defs>
+
+  <style>
+    .sans { font-family: "Segoe UI Variable Display", "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, "Microsoft JhengHei UI", "PingFang TC", "Noto Sans TC", sans-serif; }
+    .mono { font-family: "Cascadia Mono", "SFMono-Regular", Consolas, Menlo, "Liberation Mono", monospace; }
+    .caps { font-size: 12px; font-weight: 600; letter-spacing: 2.4px; fill: #5f8187; }
+    .glyph { fill: none; stroke: #e6f2f4; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; color: #e6f2f4; }
+    .packet { fill: none; stroke-width: 4; stroke-linecap: round; stroke-dasharray: 0.1 34; animation: flow 2.4s linear infinite; }
+    .packet.late { animation-delay: -1.2s; }
+    @keyframes flow { to { stroke-dashoffset: -34.1; } }
+    @media (prefers-reduced-motion: reduce) { .packet { animation: none; } }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <!-- Backdrop -->
+    <rect width="1280" height="640" fill="url(#bg)"/>
+    <rect width="1280" height="640" fill="url(#glow-corner)"/>
+    <rect width="1280" height="640" fill="url(#glow-hub)"/>
+    <rect width="1280" height="640" fill="url(#dots)" mask="url(#dots-mask)"/>
+    <g fill="none" stroke="#3cb4be">
+      <circle cx="872" cy="320" r="104" stroke-opacity="0.16"/>
+      <circle cx="872" cy="320" r="164" stroke-opacity="0.09" stroke-dasharray="2 7"/>
+      <circle cx="872" cy="320" r="236" stroke-opacity="0.05"/>
+    </g>
+
+    <!-- Wordmark -->
+    <g transform="translate(80 136)">
+      <rect width="72" height="72" rx="18" fill="url(#mark)"/>
+      <rect x="0.75" y="0.75" width="70.5" height="70.5" rx="17.25" fill="none" stroke="url(#sheen)" stroke-width="1.5"/>
+      <use href="#split" transform="translate(4 4)"/>
+    </g>
+    <text class="sans" x="76" y="292" font-size="68" font-weight="700" letter-spacing="-1.5" fill="url(#title-fill)">ProxyDesk</text>
+    <text class="sans" x="80" y="338" font-size="25" font-weight="600" fill="#a9d9de">Split-tunnel proxy client for Windows</text>
+    <text class="sans" font-size="18.5" fill="#86a0a7">
+      <tspan x="80" y="378">Only the apps and domains you pick go through</tspan>
+      <tspan x="80" y="406">a proxy — everything else stays direct.</tspan>
+    </text>
+    <g class="sans" font-size="14" font-weight="600" fill="#cfe3e6" text-anchor="middle">
+      <rect x="80" y="440" width="124" height="34" rx="17" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.13"/>
+      <text x="142" y="462">sing-box TUN</text>
+      <rect x="214" y="440" width="148" height="34" rx="17" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.13"/>
+      <text x="288" y="462">Per-app routing</text>
+      <rect x="372" y="440" width="188" height="34" rx="17" fill="#ffffff" fill-opacity="0.05" stroke="#ffffff" stroke-opacity="0.13"/>
+      <text x="466" y="462">WARP · SOCKS5 · HTTP</text>
+    </g>
+    <text class="mono" x="80" y="580" font-size="13" letter-spacing="1.2" fill="#4d6a70">WINDOWS 10 / 11 · x64 · OPEN SOURCE (MIT)</text>
+
+    <!-- Column labels -->
+    <g class="sans caps" text-anchor="middle">
+      <text x="664" y="112">APPS</text>
+      <text x="872" y="112">ROUTE</text>
+      <text x="1128" y="112">EXIT</text>
+    </g>
+
+    <!-- Streams into ProxyDesk -->
+    <g fill="none" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.75">
+      <path d="M694 200C752 200 760 298 808 298" stroke="url(#in-proxy)"/>
+      <path d="M694 280C748 280 762 312 808 312" stroke="url(#in-proxy)"/>
+      <path d="M694 360C748 360 762 328 808 328" stroke="url(#in-direct)"/>
+      <path d="M694 440C752 440 760 342 808 342" stroke="url(#in-direct)"/>
+      <path d="M936 300.8C990 300.8 988 200 1040 200" stroke="url(#out-proxy)" stroke-width="3"/>
+      <path d="M936 339.2C990 339.2 988 440 1040 440" stroke="url(#out-direct)" stroke-width="3"/>
+    </g>
+    <g class="packet-layer">
+      <path d="M694 200C752 200 760 298 808 298" class="packet" stroke="#9cc6ff"/>
+      <path d="M694 280C748 280 762 312 808 312" class="packet late" stroke="#9cc6ff"/>
+      <path d="M694 360C748 360 762 328 808 328" class="packet" stroke="#8ff0c8"/>
+      <path d="M694 440C752 440 760 342 808 342" class="packet late" stroke="#8ff0c8"/>
+      <path d="M936 300.8C990 300.8 988 200 1040 200" class="packet late" stroke="#9cc6ff"/>
+      <path d="M936 339.2C990 339.2 988 440 1040 440" class="packet" stroke="#8ff0c8"/>
+    </g>
+
+    <!-- App tiles: the top two are routed through a node, the bottom two go direct. -->
+    <g>
+      <rect x="634" y="170" width="60" height="60" rx="16" fill="url(#glass)" stroke="#4a95ee" stroke-opacity="0.55"/>
+      <use href="#i-game" class="glyph" transform="translate(649 185) scale(1.25)"/>
+      <rect x="634" y="250" width="60" height="60" rx="16" fill="url(#glass)" stroke="#4a95ee" stroke-opacity="0.55"/>
+      <use href="#i-chat" class="glyph" transform="translate(649 265) scale(1.25)"/>
+      <rect x="634" y="330" width="60" height="60" rx="16" fill="url(#glass)" stroke="#22b67f" stroke-opacity="0.55"/>
+      <use href="#i-browser" class="glyph" transform="translate(649 345) scale(1.25)"/>
+      <rect x="634" y="410" width="60" height="60" rx="16" fill="url(#glass)" stroke="#22b67f" stroke-opacity="0.55"/>
+      <use href="#i-terminal" class="glyph" transform="translate(649 425) scale(1.25)"/>
+    </g>
+
+    <!-- Hub -->
+    <circle cx="872" cy="320" r="70" fill="#2fb0ba" fill-opacity="0.35" filter="url(#soft-glow)"/>
+    <g filter="url(#hub-shadow)">
+      <rect x="808" y="256" width="128" height="128" rx="34" fill="url(#mark)"/>
+    </g>
+    <rect x="809" y="257" width="126" height="126" rx="33" fill="none" stroke="url(#sheen)" stroke-width="2"/>
+    <use href="#split" transform="translate(820.8 268.8) scale(1.6)"/>
+    <text class="mono" x="872" y="420" font-size="12" letter-spacing="0.6" fill="#6f9298" text-anchor="middle">sing-box · TUN</text>
+
+    <!-- Exit: proxy nodes -->
+    <g>
+      <rect x="1040" y="132" width="176" height="136" rx="18" fill="url(#glass)" stroke="#4a95ee" stroke-opacity="0.45"/>
+      <circle cx="1062" cy="158" r="5" fill="#4a95ee"/>
+      <text class="sans" x="1074" y="163.5" font-size="15" font-weight="600" fill="#eef6f8">Proxy</text>
+      <text class="sans" x="1200" y="163" font-size="11.5" font-weight="600" letter-spacing="0.8" fill="#7fb2ee" text-anchor="end">AUTO</text>
+      <rect x="1050" y="178" width="156" height="24" rx="7" fill="#4a95ee" fill-opacity="0.16"/>
+      <g class="sans" font-size="14" fill="#d3e2e6">
+        <text x="1060" y="194.5">Tokyo</text>
+        <text x="1060" y="220.5" fill="#9fb3ba">Seoul</text>
+        <text x="1060" y="246.5" fill="#9fb3ba">Singapore</text>
+      </g>
+      <g class="mono" font-size="12.5" fill="#8fbcf2" text-anchor="end">
+        <text x="1196" y="194.5">31 ms</text>
+        <text x="1196" y="220.5" fill="#6d8c93">44 ms</text>
+        <text x="1196" y="246.5" fill="#6d8c93">58 ms</text>
+      </g>
+    </g>
+
+    <!-- Exit: direct -->
+    <g>
+      <rect x="1040" y="392" width="176" height="96" rx="18" fill="url(#glass)" stroke="#22b67f" stroke-opacity="0.45"/>
+      <circle cx="1062" cy="420" r="5" fill="#22b67f"/>
+      <text class="sans" x="1074" y="425.5" font-size="15" font-weight="600" fill="#eef6f8">Direct</text>
+      <text class="sans" x="1060" y="460" font-size="14" fill="#9fb3ba">GeoIP · final</text>
+      <g fill="none" stroke="#5fd3a4" stroke-width="1.6" stroke-linecap="round">
+        <circle cx="1186" cy="440" r="15"/>
+        <ellipse cx="1186" cy="440" rx="6.5" ry="15"/>
+        <path d="M1171 440h30M1174 432h24M1174 448h24"/>
+      </g>
+    </g>
+
+    <!-- Inner border -->
+    <rect x="0.75" y="0.75" width="1278.5" height="638.5" rx="27.25" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="1.5"/>
+  </g>
+</svg>

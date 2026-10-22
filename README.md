@@ -1,10 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/src-tauri/icons/128x128.png" width="96" alt="ProxyDesk" />
-
-# ProxyDesk
-
-**A Windows split-tunnel client that sends only the apps and domains you pick through a proxy**
+<img src="assets/hero.svg" width="100%" alt="ProxyDesk — a Windows split-tunnel client that sends only the apps and domains you pick through a proxy" />
 
 English | [繁體中文](README.zh-TW.md)
 
@@ -137,6 +133,7 @@ apps/desktop/src-tauri/   Tauri backend: sing-box child process, Clash API clien
 apps/desktop/src/         React frontend: dashboard, nodes, groups, connections, traffic, logs, settings
 docker/m0/                M0 Docker verification setup
 scripts/                  fetch-singbox.ps1 and fetch-rulesets.ps1
+assets/                   logo, README artwork and social preview (editable text masters in assets/src/)
 ```
 
 ## Credits
@@ -152,6 +149,6 @@ ProxyDesk would not exist without these projects. The installer bundles them unm
 
 ## License
 
-ProxyDesk is released under the [MIT License](LICENSE). The bundled components above keep their own licenses.
+ProxyDesk is released under the [MIT License](LICENSE), including the logo and artwork in [`assets/`](assets). The bundled components above keep their own licenses.
 
 ProxyDesk is not affiliated with Mudfish or Cloudflare.

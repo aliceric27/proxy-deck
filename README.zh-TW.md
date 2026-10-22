@@ -1,10 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/src-tauri/icons/128x128.png" width="96" alt="ProxyDesk" />
-
-# ProxyDesk
-
-**只讓指定的程式與網域走代理的 Windows 分流客戶端**
+<img src="assets/hero.zh-TW.svg" width="100%" alt="ProxyDesk：只讓指定的程式與網域走代理的 Windows 分流客戶端" />
 
 [English](README.md) | 繁體中文
 
@@ -137,6 +133,7 @@ apps/desktop/src-tauri/   Tauri 後端：sing-box 子程序管理、Clash API cl
 apps/desktop/src/         React 前端：總覽、節點、分流群組、連線、流量統計、日誌、設定
 docker/m0/                M0 Docker 驗證環境
 scripts/                  fetch-singbox.ps1 與 fetch-rulesets.ps1
+assets/                   標誌、README 主視覺與社群預覽圖（可編輯的文字原稿在 assets/src/）
 ```
 
 ## 致謝
@@ -152,6 +149,6 @@ ProxyDesk 建立在以下專案之上。安裝檔內附的部分都未經修改�
 
 ## 授權
 
-ProxyDesk 以 [MIT](LICENSE) 授權釋出；上列內附元件維持各自的授權。
+ProxyDesk 以 [MIT](LICENSE) 授權釋出，[`assets/`](assets) 中的標誌與主視覺也包含在內；上列內附元件維持各自的授權。
 
 ProxyDesk 與 Mudfish、Cloudflare 沒有任何關係。

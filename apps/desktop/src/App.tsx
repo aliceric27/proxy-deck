@@ -22,6 +22,20 @@ const PAGES: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: "settings", label: "設定", icon: <SettingsIcon size={16} /> },
 ];
 
+/** The split mark of `assets/logo.svg`: one stream in, out through a node (dot) or direct (ring). */
+function LogoMark() {
+  return (
+    <svg viewBox="8 8 48 48" width={20} height={20} aria-hidden="true">
+      <g fill="none" stroke="currentColor" strokeWidth={5} strokeLinecap="round">
+        <path d="M12 32H24C32 32 34 20 40.5 20" />
+        <path d="M24 32C32 32 34 44 40.5 44" />
+      </g>
+      <circle cx={47} cy={20} r={5.5} fill="currentColor" />
+      <circle cx={47} cy={44} r={4.5} fill="none" stroke="currentColor" strokeWidth={3} />
+    </svg>
+  );
+}
+
 export default function App() {
   const { snapshot, core, profileState, busy, connect, disconnect, toasts, dismissToast } = useApp();
   const [page, setPage] = useState<PageId>("dashboard");
@@ -55,7 +69,7 @@ export default function App() {
       <nav className="flex w-52 shrink-0 flex-col border-r border-border bg-surface" aria-label="主選單">
         <div className="flex h-14 items-center gap-2 px-4">
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-text">
-            <Power size={15} strokeWidth={2.5} />
+            <LogoMark />
           </div>
           <span className="text-sm font-semibold">ProxyDesk</span>
         </div>

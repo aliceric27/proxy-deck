@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">ProxyDesk</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4fc9d2"/>
+      <stop offset="1" stop-color="#0b6a73"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#tile)"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="15.25" fill="none" stroke="url(#sheen)" stroke-width="1.5"/>
+  <!-- One stream in, split in two: through a node (filled) or direct (ring). -->
+  <g fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round">
+    <path d="M12 32H24C32 32 34 20 40.5 20"/>
+    <path d="M24 32C32 32 34 44 40.5 44"/>
+  </g>
+  <circle cx="47" cy="20" r="5.5" fill="#ffffff"/>
+  <circle cx="47" cy="44" r="4.5" fill="none" stroke="#ffffff" stroke-width="3"/>
+</svg>
