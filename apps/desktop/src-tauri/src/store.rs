@@ -87,8 +87,16 @@ fn free_bad_name(path: &Path) -> PathBuf {
 }
 
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_atomic(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?)
+}
+
+/// Like [`save`] without indentation, for large files nobody edits by hand (the traffic history).
+pub fn save_compact<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_atomic(path, serde_json::to_vec(value).map_err(|e| e.to_string())?)
+}
+
+fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     std::fs::write(&tmp, bytes).map_err(|e| format!("寫入 {} 失敗: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("取代 {} 失敗: {e}", path.display()))
 }

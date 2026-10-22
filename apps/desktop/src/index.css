@@ -17,6 +17,10 @@
   --warn-soft: #fdf1e3;
   --danger: #c4312b;
   --danger-soft: #fdebea;
+  /* Chart series (validated for CVD separation on --surface): through a node / direct / not attributed. */
+  --viz-proxy: #2a78d6;
+  --viz-direct: #1baf7a;
+  --viz-other: #c3c8d1;
   color-scheme: light;
 }
 
@@ -37,6 +41,9 @@
     --warn-soft: #3a2a17;
     --danger: #f2675f;
     --danger-soft: #3d1c1b;
+    --viz-proxy: #3987e5;
+    --viz-direct: #199e70;
+    --viz-other: #4a5263;
     color-scheme: dark;
   }
 }

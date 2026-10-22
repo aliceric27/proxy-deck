@@ -15,6 +15,7 @@ use crate::clash::ClashProxy;
 use crate::core::{CoreStatus, LogBatch};
 use crate::credentials::{self, Credentials};
 use crate::nodes::{self, NodeList, PingResult};
+use crate::stats::{TrafficHistory, TrafficSession};
 use crate::system::{self, ProcessInfo, RuleSetCatalog};
 use crate::AppState;
 
@@ -198,7 +199,7 @@ pub async fn verify_account(state: State<'_, AppState>) -> CmdResult<crate::mudf
         .map(|n| n.ip)
         .collect();
     if ips.is_empty() {
-        ips = nodes::get(&state.paths, &state.http, false).await?.nodes.into_iter().map(|n| n.ip).collect();
+        ips = state.node_list.get(&state.http, false).await?.nodes.into_iter().map(|e| e.node.ip).collect();
     }
     if ips.is_empty() {
         return Err("沒有可用的節點可供測試".into());
@@ -206,9 +207,11 @@ pub async fn verify_account(state: State<'_, AppState>) -> CmdResult<crate::mudf
     Ok(crate::mudfish_probe::check_account(&creds, &ips).await)
 }
 
+/// The Mudfish node list: fetched by the first load of each run (the frontend makes it at startup),
+/// then reused unless `force`. Offline, the saved list comes back with `error` set.
 #[tauri::command]
 pub async fn get_nodes(state: State<'_, AppState>, force: bool) -> CmdResult<NodeList> {
-    nodes::get(&state.paths, &state.http, force).await.map(NodeList::from)
+    state.node_list.get(&state.http, force).await
 }
 
 #[tauri::command]
@@ -282,4 +285,22 @@ pub async fn rule_set_catalog(state: State<'_, AppState>) -> CmdResult<RuleSetCa
 #[tauri::command]
 pub async fn open_data_dir(state: State<'_, AppState>) -> CmdResult<()> {
     tauri_plugin_opener::open_path(&state.paths.config_dir, None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Every recorded connection session, oldest first; the running one is last (`ended_at: null`).
+#[tauri::command]
+pub async fn traffic_history(state: State<'_, AppState>) -> CmdResult<TrafficHistory> {
+    Ok(state.stats.history())
+}
+
+/// The running session alone (`null`: none), for refreshing it without the whole history.
+#[tauri::command]
+pub async fn traffic_current(state: State<'_, AppState>) -> CmdResult<Option<TrafficSession>> {
+    Ok(state.stats.current())
+}
+
+/// Forgets the closed sessions; a running session keeps counting.
+#[tauri::command]
+pub async fn traffic_history_clear(state: State<'_, AppState>) -> CmdResult<()> {
+    state.stats.clear()
 }

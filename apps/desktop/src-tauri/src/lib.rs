@@ -5,6 +5,7 @@ mod credentials;
 mod mudfish_probe;
 mod nodes;
 mod paths;
+mod stats;
 mod store;
 mod system;
 mod traffic;
@@ -18,23 +19,31 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::RwLock;
 
 use crate::core::{CoreEvents, CoreManager, CoreStatus, LogBatch, SingBox};
+use crate::nodes::NodeSource;
 use crate::paths::Paths;
+use crate::stats::TrafficStats;
 
 pub struct AppState {
     pub paths: Paths,
     pub profile: RwLock<Profile>,
     pub core: Arc<CoreManager>,
     pub http: reqwest::Client,
+    pub node_list: NodeSource,
+    /// Per-session traffic history; follows the core's status (see `TauriEvents`).
+    pub stats: Arc<TrafficStats>,
     /// Something the user should know from startup: the profile was unreadable and the defaults
     /// replaced it. Set once, shown by the UI for as long as the app runs.
     pub notice: Option<String>,
 }
 
-/// Forwards core notifications to the webview (`core-status`, batched `core-log`) and the tray.
-struct TauriEvents(AppHandle);
+/// Forwards core notifications to the webview (`core-status`, batched `core-log`), the tray and
+/// the traffic history. The history hears every status change synchronously, in order, so a
+/// session can never take bytes of the core before or after it.
+struct TauriEvents(AppHandle, Arc<TrafficStats>);
 
 impl CoreEvents for TauriEvents {
     fn status(&self, status: &CoreStatus) {
+        self.1.on_status(status);
         let _ = self.0.emit("core-status", status);
         // Queued, not awaited: tray calls wait for the main thread, and the caller holds the
         // core's state lock (the main thread may itself be waiting on the core at exit).
@@ -74,6 +83,7 @@ pub fn quit(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Some(state) = app.try_state::<AppState>() {
             state.core.stop().await;
+            state.stats.persist(true);
         }
         app.exit(0);
     });
@@ -104,8 +114,9 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
 fn setup(app: &mut tauri::App) -> Result<(), String> {
     let paths = Paths::resolve(app.handle())?;
     let (profile, notice) = store::load_profile(&paths.profile_file())?;
+    let stats = Arc::new(TrafficStats::load(paths.traffic_history_file(), paths.traffic_current_file()));
     let launcher = Arc::new(SingBox { exe: paths.sing_box.clone(), run_dir: paths.run_dir.clone() });
-    let core = CoreManager::new(launcher, Arc::new(TauriEvents(app.handle().clone())));
+    let core = CoreManager::new(launcher, Arc::new(TauriEvents(app.handle().clone(), stats.clone())));
     tauri::async_runtime::spawn(core.log_task());
     tauri::async_runtime::block_on(core.begin_orphan_sweep());
     // Own HTTP (Mudfish list, WARP API) ignores any system proxy, like the Clash client.
@@ -114,7 +125,8 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
-    app.manage(AppState { paths, profile: RwLock::new(profile), core, http, notice });
+    let node_list = NodeSource::new(paths.node_cache_file());
+    app.manage(AppState { paths, profile: RwLock::new(profile), core, http, node_list, stats, notice });
     create_main_window(app.handle()).map_err(|e| e.to_string())?;
     tray::create(app.handle()).map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn(traffic::run(app.handle().clone()));
@@ -163,6 +175,9 @@ pub fn run() {
             commands::list_processes,
             commands::rule_set_catalog,
             commands::open_data_dir,
+            commands::traffic_history,
+            commands::traffic_current,
+            commands::traffic_history_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ProxyDesk");
@@ -172,6 +187,7 @@ pub fn run() {
             // Last-chance cleanup if the app exits without going through `quit`.
             if let Some(state) = app.try_state::<AppState>() {
                 tauri::async_runtime::block_on(state.core.stop());
+                state.stats.persist(true);
             }
         }
     });

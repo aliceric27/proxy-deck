@@ -5,4 +5,8 @@ import type { NodeEntry } from "./NodeEntry";
  * The node list as the UI gets it: each entry carries the `ProxyNode` to add, so the
  * Mudfish → node conversion exists only in proxy-core.
  */
-export type NodeList = { fetched_at: number, nodes: Array<NodeEntry>, };
+export type NodeList = { fetched_at: number, nodes: Array<NodeEntry>, 
+/**
+ * Why the list could not be updated: `nodes` is then the list saved at `fetched_at`.
+ */
+error: string | null, };

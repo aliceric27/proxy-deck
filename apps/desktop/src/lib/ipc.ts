@@ -19,6 +19,8 @@ import type { RuleGroup } from "./bindings/RuleGroup";
 import type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
 import type { Snapshot } from "./bindings/Snapshot";
 import type { Traffic } from "./bindings/Traffic";
+import type { TrafficHistory } from "./bindings/TrafficHistory";
+import type { TrafficSession } from "./bindings/TrafficSession";
 
 export type { AccountCheck } from "./bindings/AccountCheck";
 export type { ClashProxy } from "./bindings/ClashProxy";
@@ -26,6 +28,7 @@ export type { Connection } from "./bindings/Connection";
 export type { CoreStatus } from "./bindings/CoreStatus";
 export type { CustomNodeInput } from "./bindings/CustomNodeInput";
 export type { CustomProxy } from "./bindings/CustomProxy";
+export type { ExitKind } from "./bindings/ExitKind";
 export type { GeoIpGroup } from "./bindings/GeoIpGroup";
 export type { GroupImport } from "./bindings/GroupImport";
 export type { ImportedGroup } from "./bindings/ImportedGroup";
@@ -34,6 +37,7 @@ export type { LogLevel } from "./bindings/LogLevel";
 export type { MatchMode } from "./bindings/MatchMode";
 export type { Mode } from "./bindings/Mode";
 export type { NodeEntry } from "./bindings/NodeEntry";
+export type { NodeList } from "./bindings/NodeList";
 export type { ProcessInfo } from "./bindings/ProcessInfo";
 export type { Profile } from "./bindings/Profile";
 export type { ProfileState } from "./bindings/ProfileState";
@@ -42,9 +46,14 @@ export type { ProxyNode } from "./bindings/ProxyNode";
 export type { ProxyProtocol } from "./bindings/ProxyProtocol";
 export type { RuleGroup } from "./bindings/RuleGroup";
 export type { RuleSetCatalog } from "./bindings/RuleSetCatalog";
+export type { SessionEnd } from "./bindings/SessionEnd";
 export type { Snapshot } from "./bindings/Snapshot";
+export type { Timeline } from "./bindings/Timeline";
 export type { Traffic } from "./bindings/Traffic";
+export type { TrafficHistory } from "./bindings/TrafficHistory";
+export type { TrafficSession } from "./bindings/TrafficSession";
 export type { UdpPolicy } from "./bindings/UdpPolicy";
+export type { Usage } from "./bindings/Usage";
 
 /** Mirrors `RuleGroup::selector_tag` in proxy-core. */
 export const groupSelectorTag = (g: RuleGroup) => `group-${g.id}`;
@@ -61,6 +70,7 @@ export const api = {
   clearCredentials: () => invoke<void>("clear_credentials"),
   /** Auth-only check of the stored Mudfish account against live nodes; costs no traffic. */
   verifyAccount: () => invoke<AccountCheck>("verify_account"),
+  /** Fetched by the first call of each run, then reused unless `force`; `error` set: Mudfish could not be reached and this is the saved list. */
   nodes: (force: boolean) => invoke<NodeList>("get_nodes", { force }),
   warpCreate: () => invoke<ProxyNode>("warp_create"),
   /** Unregisters a just-created WARP device whose node could not be saved. */
@@ -86,6 +96,12 @@ export const api = {
   processes: () => invoke<ProcessInfo[]>("list_processes"),
   ruleSetCatalog: () => invoke<RuleSetCatalog>("rule_set_catalog"),
   openDataDir: () => invoke<void>("open_data_dir"),
+  /** Every connection session, oldest first; a running one is last with `ended_at: null`. */
+  trafficHistory: () => invoke<TrafficHistory>("traffic_history"),
+  /** The running session alone (`null`: none); cheaper than the whole history for frequent refreshes. */
+  trafficCurrent: () => invoke<TrafficSession | null>("traffic_current"),
+  /** Forgets the closed sessions; a running one keeps counting. */
+  clearTrafficHistory: () => invoke<void>("traffic_history_clear"),
 };
 
 export const events = {

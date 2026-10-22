@@ -1,6 +1,8 @@
-//! Live traffic for the UI: one poll of the Clash API per second while connected and the
-//! window is visible, pushed as a typed `traffic` event. Rates are computed here, so they do
-//! not reset when the user switches pages.
+//! Live traffic: one poll of the Clash API per second whenever the core has one (from the moment a
+//! (re)started core is healthy, a little before it reports `Running`). Every sample goes to the
+//! traffic history (`stats.rs`), also while the window is hidden in the tray; only while the
+//! window is visible is it pushed to the UI as a typed `traffic` event. Rates are computed here,
+//! so they do not reset when the user switches pages.
 
 use std::time::{Duration, Instant};
 
@@ -44,11 +46,11 @@ pub async fn run(app: AppHandle) {
     let mut prev: Option<(Instant, u64, u64)> = None;
     loop {
         tick.tick().await;
-        let clash = match app.try_state::<AppState>() {
-            Some(state) if window_visible(&app) => state.core.clash().await,
-            _ => None,
-        };
-        let Some(clash) = clash else {
+        let Some(state) = app.try_state::<AppState>() else { continue };
+        state.stats.persist(false);
+        // Taken before the poll: a status change while it runs makes the history drop the sample.
+        let epoch = state.stats.epoch();
+        let Some(clash) = state.core.clash().await else {
             prev = None;
             continue;
         };
@@ -56,6 +58,7 @@ pub async fn run(app: AppHandle) {
             prev = None;
             continue;
         };
+        state.stats.on_sample(epoch, &c, &*state.profile.read().await);
         let now = Instant::now();
         let (up_rate, down_rate) = match prev {
             Some((t, up, down)) => {
@@ -65,10 +68,12 @@ pub async fn run(app: AppHandle) {
             None => (0, 0),
         };
         prev = Some((now, c.upload_total, c.download_total));
-        let _ = app.emit(
-            "traffic",
-            Traffic { up_rate, down_rate, upload_total: c.upload_total, download_total: c.download_total, connections: c.connections },
-        );
+        if window_visible(&app) {
+            let _ = app.emit(
+                "traffic",
+                Traffic { up_rate, down_rate, upload_total: c.upload_total, download_total: c.download_total, connections: c.connections },
+            );
+        }
     }
 }
 

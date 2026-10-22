@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Activity, AlertTriangle, LayoutDashboard, ListFilter, Loader2, Power, ScrollText, Server, Settings as SettingsIcon, X } from "lucide-react";
+import { Activity, AlertTriangle, ChartColumn, LayoutDashboard, ListFilter, Loader2, Power, ScrollText, Server, Settings as SettingsIcon, X } from "lucide-react";
 import { useApp } from "./lib/store";
 import { Button, cx, Kbd } from "./components/ui";
 import Dashboard from "./pages/Dashboard";
@@ -7,15 +7,17 @@ import Nodes from "./pages/Nodes";
 import Groups from "./pages/Groups";
 import Connections from "./pages/Connections";
 import Logs from "./pages/Logs";
+import Stats from "./pages/Stats";
 import Settings from "./pages/Settings";
 
-export type PageId = "dashboard" | "nodes" | "groups" | "connections" | "logs" | "settings";
+export type PageId = "dashboard" | "nodes" | "groups" | "connections" | "stats" | "logs" | "settings";
 
 const PAGES: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: "dashboard", label: "總覽", icon: <LayoutDashboard size={16} /> },
   { id: "nodes", label: "節點", icon: <Server size={16} /> },
   { id: "groups", label: "分流群組", icon: <ListFilter size={16} /> },
   { id: "connections", label: "連線", icon: <Activity size={16} /> },
+  { id: "stats", label: "流量統計", icon: <ChartColumn size={16} /> },
   { id: "logs", label: "日誌", icon: <ScrollText size={16} /> },
   { id: "settings", label: "設定", icon: <SettingsIcon size={16} /> },
 ];
@@ -114,6 +116,7 @@ export default function App() {
           {page === "nodes" && <Nodes />}
           {page === "groups" && <Groups />}
           {page === "connections" && <Connections />}
+          {page === "stats" && <Stats />}
           {page === "logs" && <Logs />}
           {page === "settings" && <Settings />}
         </div>

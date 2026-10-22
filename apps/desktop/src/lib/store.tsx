@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, errorText, events, type CoreStatus, type Profile, type ProfileState, type Snapshot, type Traffic } from "./ipc";
+import { api, errorText, events, type CoreStatus, type NodeEntry, type NodeList, type Profile, type ProfileState, type ProxyNode, type Snapshot, type Traffic } from "./ipc";
 
 export interface Toast {
   id: number;
@@ -20,6 +20,12 @@ interface AppContextValue {
    * Resolves to whether the save succeeded.
    */
   updateProfile: (fn: (p: Profile) => Profile) => Promise<boolean>;
+  /**
+   * The Mudfish node list. The added Mudfish nodes follow every list fetched this run: one the list
+   * now gives another address, name or country is updated in the profile. The app loads it at
+   * startup, so each run starts from a fresh list.
+   */
+  loadNodes: (force: boolean) => Promise<NodeList>;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -29,6 +35,17 @@ interface AppContextValue {
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
+
+/** `nodes` with each Mudfish node as `list` now has it, its UDP choice kept; nodes that did not change stay the same objects. */
+function followList(nodes: ProxyNode[], list: NodeEntry[]): ProxyNode[] {
+  const listed = new Map(list.map((e) => [e.proxy.tag, e.proxy]));
+  return nodes.map((n) => {
+    const l = n.wireguard || n.custom ? undefined : listed.get(n.tag);
+    return l && (l.server !== n.server || l.port !== n.port || l.name !== n.name || l.country !== n.country)
+      ? { ...n, server: l.server, port: l.port, name: l.name, country: l.country }
+      : n;
+  });
+}
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshotState] = useState<Snapshot | null>(null);
@@ -105,6 +122,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [toast, refresh, setSnapshot],
   );
 
+  const loadNodes = useCallback(
+    async (force: boolean) => {
+      const list = await api.nodes(force);
+      const saved = snapshotRef.current?.profile.nodes ?? [];
+      // Only a list fetched this run is followed: the saved list standing in while Mudfish is unreachable may be older than the nodes.
+      const moved = list.error ? 0 : followList(saved, list.nodes).filter((n, i) => n !== saved[i]).length;
+      if (moved > 0) {
+        // Decided again against the latest profile inside the update; a reconnect applies it (`stale`).
+        updateProfile((p) => ({ ...p, nodes: followList(p.nodes, list.nodes) })).then(
+          (ok) => ok && toast(`已依最新的 Mudfish 清單更新 ${moved} 個已加入的節點（位址或名稱有變）。`),
+        );
+      }
+      return list;
+    },
+    [updateProfile, toast],
+  );
+
+  // Each run starts from a fresh Mudfish list, so the added nodes follow it before the first connect.
+  // Waits for the snapshot: the nodes to compare are in it. A failure stays quiet here (Mudfish may
+  // simply be unreachable); the node page says it.
+  const loaded = snapshot !== null;
+  useEffect(() => {
+    if (loaded) loadNodes(false).catch(() => {});
+  }, [loaded, loadNodes]);
+
   const connect = useCallback(async () => {
     setBusy(true);
     try {
@@ -136,6 +178,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       profileState,
       busy,
       updateProfile,
+      loadNodes,
       connect,
       disconnect,
       refresh,
@@ -143,7 +186,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       toasts,
       dismissToast,
     }),
-    [snapshot, core, profileState, busy, updateProfile, connect, disconnect, refresh, toast, toasts, dismissToast],
+    [snapshot, core, profileState, busy, updateProfile, loadNodes, connect, disconnect, refresh, toast, toasts, dismissToast],
   );
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

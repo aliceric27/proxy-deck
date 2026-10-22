@@ -15,8 +15,11 @@ function nodeAddress(n: ProxyNode): string {
   return n.server;
 }
 
+/** A list's `fetched_at` (Unix seconds) for display. */
+const listTime = (s: number) => new Date(s * 1000).toLocaleString("zh-TW");
+
 export default function Nodes() {
-  const { profile, core, updateProfile, toast } = useApp();
+  const { profile, core, updateProfile, loadNodes, toast } = useApp();
   const running = core.state === "running";
   const [creatingWarp, setCreatingWarp] = useState(false);
   const [confirmWarp, setConfirmWarp] = useState(false);
@@ -24,6 +27,8 @@ export default function Nodes() {
   const [customDialog, setCustomDialog] = useState<{ node?: ProxyNode } | null>(null);
   const [nodes, setNodes] = useState<NodeEntry[]>([]);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
+  /** Why the list could not be updated (it is then the one saved at `fetchedAt`). */
+  const [listError, setListError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
   const [country, setCountry] = useState("all");
@@ -37,16 +42,18 @@ export default function Nodes() {
     async (force: boolean) => {
       setLoading(true);
       try {
-        const r = await api.nodes(force);
+        const r = await loadNodes(force);
         setNodes(r.nodes);
         setFetchedAt(r.fetched_at);
+        setListError(r.error);
+        if (force && r.error) toast(`無法更新節點清單，繼續使用 ${listTime(r.fetched_at)} 的清單。\n${r.error}`, "error");
       } catch (e) {
         toast(errorText(e), "error");
       } finally {
         setLoading(false);
       }
     },
-    [toast],
+    [loadNodes, toast],
   );
 
   useEffect(() => {
@@ -137,7 +144,22 @@ export default function Nodes() {
     <div className="flex h-full flex-col">
       <PageHeader
         title="節點"
-        subtitle={fetchedAt ? `Mudfish 共 ${nodes.length} 個節點 · 清單更新於 ${new Date(fetchedAt * 1000).toLocaleString("zh-TW")}` : "載入 Mudfish 節點清單…"}
+        subtitle={
+          fetchedAt ? (
+            <>
+              Mudfish 共 {nodes.length} 個節點 ·{" "}
+              {listError ? (
+                <span className="text-warn" title={listError}>
+                  無法更新，使用 {listTime(fetchedAt)} 的清單
+                </span>
+              ) : (
+                `清單更新於 ${listTime(fetchedAt)}`
+              )}
+            </>
+          ) : (
+            "載入 Mudfish 節點清單…"
+          )
+        }
         actions={
           <>
             <Button onClick={ping} disabled={pinging || !visible.length} icon={pinging ? <Loader2 size={14} className="animate-spin" /> : <Gauge size={14} />}>

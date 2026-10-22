@@ -49,6 +49,16 @@ impl Paths {
     pub fn node_cache_file(&self) -> PathBuf {
         self.config_dir.join("mudfish-nodes.json")
     }
+
+    /// Closed connection sessions (`stats.rs`).
+    pub fn traffic_history_file(&self) -> PathBuf {
+        self.config_dir.join("traffic-history.json")
+    }
+
+    /// The running session, rewritten once a minute; filed as interrupted by the next start.
+    pub fn traffic_current_file(&self) -> PathBuf {
+        self.config_dir.join("traffic-current.json")
+    }
 }
 
 #[cfg(windows)]
