@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches app version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match tauri.conf.json version $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Fetch sing-box sidecar
+        run: pwsh -File scripts/fetch-singbox.ps1
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build installer
+        working-directory: apps/desktop
+        run: npm run tauri build
+
+      # A draft: review the notes and the installer, then publish it by hand.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = "target/release/bundle/nsis/ProxyDesk_${env:VERSION}_x64-setup.exe"
+          if (-not (Test-Path $installer)) { throw "Installer not found: $installer" }
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          $sums = "target/release/bundle/nsis/SHA256SUMS.txt"
+          "$hash  $(Split-Path $installer -Leaf)" | Set-Content $sums -Encoding ascii
+          gh release create $env:TAG $installer $sums --draft --verify-tag --title "ProxyDesk $env:TAG" --generate-notes

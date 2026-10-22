@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Windows only: TUN, Job Objects and Credential Manager. Hosted runners are elevated,
+    # which the secured-directory tests need.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # The sidecar is not in git; tauri-build needs it, and the tests run `sing-box check`.
+      - name: Fetch sing-box sidecar
+        run: pwsh -File scripts/fetch-singbox.ps1
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # tsc + vite; the Tauri crate also needs ../dist to compile.
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        env:
+          SINGBOX_BIN: ${{ github.workspace }}\apps\desktop\src-tauri\binaries\sing-box-x86_64-pc-windows-msvc.exe
+        run: cargo test --workspace --locked
+
+      # `cargo test` regenerates the ts-rs bindings; they must match what is committed.
+      - name: Check generated bindings
+        run: |
+          $changes = git status --porcelain -- apps/desktop/src/lib/bindings
+          if ($changes) {
+            $changes
+            git diff -- apps/desktop/src/lib/bindings
+            throw "TypeScript bindings are out of date: run cargo test --workspace and commit apps/desktop/src/lib/bindings"
+          }

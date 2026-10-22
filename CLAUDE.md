@@ -16,6 +16,8 @@ cargo test --workspace                        # also regenerates apps/desktop/sr
 cd apps/desktop; npx tsc --noEmit
 ```
 
+GitHub (`aliceric27/proxy-deck`): `.github/workflows/ci.yml` runs on `windows-latest` — fetch sidecar, `npm ci` + `npm run build` (the Tauri crate needs `../dist`), clippy `-D warnings`, `cargo test --workspace` with `SINGBOX_BIN`, and fails if the regenerated bindings differ from the committed ones. `release.yml` runs on a `v*` tag: the tag must equal `tauri.conf.json`'s version, and it builds the NSIS installer and creates a **draft** release with it and `SHA256SUMS.txt`. A release bumps the version in `Cargo.toml` (workspace), `Cargo.lock`, `package.json`, `package-lock.json` and `tauri.conf.json`. `README.md` is English, `README.zh-TW.md` Traditional Chinese — keep both in step.
+
 The app manifest is `requireAdministrator` (TUN), so `tauri dev` and `cargo test -p proxydesk` need an elevated shell. Debug builds expose WebView2 DevTools on `PROXYDESK_CDP_PORT` (e.g. 9222) for Playwright `connectOverCDP` UI automation; release builds never do. While that port is open any local process can drive the elevated webview — set it only for automation runs.
 
 ## Architecture
