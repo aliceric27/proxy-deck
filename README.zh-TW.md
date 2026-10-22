@@ -8,7 +8,7 @@
 
 [English](README.md) | 繁體中文
 
-[![Release](https://img.shields.io/github/v/release/aliceric27/proxy-deck?include_prereleases&sort=semver)](https://github.com/aliceric27/proxy-deck/releases)
+[![Release](https://img.shields.io/github/v/release/aliceric27/proxy-deck?sort=semver)](https://github.com/aliceric27/proxy-deck/releases)
 [![CI](https://github.com/aliceric27/proxy-deck/actions/workflows/ci.yml/badge.svg)](https://github.com/aliceric27/proxy-deck/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/aliceric27/proxy-deck/total)](https://github.com/aliceric27/proxy-deck/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -94,19 +94,19 @@ Mudfish 節點清單每次開啟程式都會重新取得，已加入的 Mudfish 
 
 - 介面：Tauri v2（Rust）+ React + Tailwind，桌面優先的佈局
 - 核心：未修改的 sing-box 1.14.2，以獨立子程序執行（GPL-3.0，不連結）
-- 規劃與決策紀錄：[`docs/PLAN.md`](docs/PLAN.md)
 
 需要：Rust（stable，MSVC）、Visual Studio Build Tools（C++ 工作負載）、Node.js 22+、WebView2。
 
 ```powershell
 pwsh -File scripts/fetch-singbox.ps1   # 下載 sing-box 並核對 SHA-256，放到 src-tauri/binaries/
+pwsh -File scripts/fetch-rulesets.ps1  # 下載固定版本的規則集並核對 SHA-256，放到 src-tauri/resources/rulesets/
 cd apps/desktop
 npm install
 npm run tauri dev                       # 開發模式；TUN 需要系統管理員權限的終端機
 npm run tauri build                     # 產出 target/release/bundle/nsis/ProxyDesk_<ver>_x64-setup.exe
 ```
 
-app 的 manifest 要求系統管理員權限（v1 用這個方式取得 TUN 權限，見 PLAN §6.1）。從非系統管理員的終端機啟動時，會跳出 UAC 提示。
+app 的 manifest 要求系統管理員權限（v1 用這個方式取得 TUN 權限）。從非系統管理員的終端機啟動時，會跳出 UAC 提示。
 
 ### 測試
 
@@ -118,7 +118,7 @@ cargo test --workspace                  # 含核心狀態機（假 launcher）�
 cd apps/desktop; npx tsc --noEmit       # 前端型別檢查
 ```
 
-M0 驗證環境：`docker/m0/`（Linux 容器，見該目錄 README）與 `docs/m0-spike/windows/run-m0.ps1`（Windows 主機）。兩者都從專案根目錄的 `.env.local`（`MUDFISH_USER=` / `MUDFISH_PASS=`，不得提交）讀取帳密。
+M0 驗證環境：`docker/m0/`（Linux 容器，見該目錄 README），從專案根目錄的 `.env.local`（`MUDFISH_USER=` / `MUDFISH_PASS=`，不得提交）讀取帳密。
 
 ### 發布
 
@@ -136,13 +136,22 @@ crates/proxy-core/        設定模型（Profile）、Mudfish 清單解析、手
 apps/desktop/src-tauri/   Tauri 後端：sing-box 子程序管理、Clash API client、認證管理員、流量統計、系統匣
 apps/desktop/src/         React 前端：總覽、節點、分流群組、連線、流量統計、日誌、設定
 docker/m0/                M0 Docker 驗證環境
-docs/                     PLAN.md 與 M0 驗證腳本
+scripts/                  fetch-singbox.ps1 與 fetch-rulesets.ps1
 ```
+
+## 致謝
+
+ProxyDesk 建立在以下專案之上。安裝檔內附的部分都未經修改，另見 [`THIRD_PARTY_NOTICES.txt`](apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt)。
+
+- [sing-box](https://github.com/SagerNet/sing-box)（GPL-3.0-or-later）：代理核心，以獨立程序執行，ProxyDesk 不與它連結。
+- [Karing 規則集](https://github.com/KaringX/karing-ruleset)：內建的 geosite、geoip 與 acl 規則集是它 `sing` 分支的快照（2026-10-06），來源為：
+  - geosite 與 geoip：[MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)（GPL-3.0），以 [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)（MIT）與公開的 GeoIP 資料建置；
+  - acl：[ACL4SSR](https://github.com/ACL4SSR/ACL4SSR)（CC BY-SA 4.0）。
+- [Karing](https://github.com/KaringX/karing)：群組匯入支援它的分流規則格式。
+- [Tauri](https://tauri.app)、[React](https://react.dev)、[Tailwind CSS](https://tailwindcss.com) 與 [Lucide](https://lucide.dev)：app 本身。
 
 ## 授權
 
-ProxyDesk 以 [MIT](LICENSE) 授權釋出。
-
-安裝檔內附未修改的 [sing-box](https://github.com/SagerNet/sing-box) 官方執行檔（GPL-3.0-or-later），以獨立程序執行，ProxyDesk 不與它連結；規則集等其他第三方元件與其授權見 [`THIRD_PARTY_NOTICES.txt`](apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt)。
+ProxyDesk 以 [MIT](LICENSE) 授權釋出；上列內附元件維持各自的授權。
 
 ProxyDesk 與 Mudfish、Cloudflare 沒有任何關係。

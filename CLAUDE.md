@@ -2,12 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-ProxyDesk is a Windows desktop proxy client: it pulls SOCKS5 nodes from Mudfish (plus generated Cloudflare WARP nodes and hand-added HTTP/SOCKS5 proxies) and runs sing-box in TUN mode so only chosen apps/domains go through the proxy. Design decisions and verified findings live in `docs/PLAN.md` — read the relevant section before changing routing, DNS, or privilege behavior.
+ProxyDesk is a Windows desktop proxy client: it pulls SOCKS5 nodes from Mudfish (plus generated Cloudflare WARP nodes and hand-added HTTP/SOCKS5 proxies) and runs sing-box in TUN mode so only chosen apps/domains go through the proxy. Design decisions and verified findings live in `docs/PLAN.md` (local only: `docs/` is gitignored and not on GitHub) — read the relevant section before changing routing, DNS, or privilege behavior.
 
 ## Commands
 
 ```powershell
 pwsh -File scripts/fetch-singbox.ps1          # required once: sidecar binary is not in git
+pwsh -File scripts/fetch-rulesets.ps1         # required once: resources/rulesets/ (.srs snapshot) is not in git either
 cd apps/desktop; npm install; npm run tauri dev
 npm run tauri build                           # NSIS installer in target/release/bundle/nsis/
 cargo test -p proxy-core                      # set SINGBOX_BIN=<sidecar exe> to also run `sing-box check` on generated configs
@@ -16,7 +17,7 @@ cargo test --workspace                        # also regenerates apps/desktop/sr
 cd apps/desktop; npx tsc --noEmit
 ```
 
-GitHub (`aliceric27/proxy-deck`): `.github/workflows/ci.yml` runs on `windows-latest` — fetch sidecar, `npm ci` + `npm run build` (the Tauri crate needs `../dist`), clippy `-D warnings`, `cargo test --workspace` with `SINGBOX_BIN`, and fails if the regenerated bindings differ from the committed ones. `release.yml` runs on a `v*` tag: the tag must equal `tauri.conf.json`'s version, and it builds the NSIS installer and creates a **draft** release with it and `SHA256SUMS.txt`. A release bumps the version in `Cargo.toml` (workspace), `Cargo.lock`, `package.json`, `package-lock.json` and `tauri.conf.json`. `README.md` is English, `README.zh-TW.md` Traditional Chinese — keep both in step.
+GitHub (`aliceric27/proxy-deck`): `.github/workflows/ci.yml` runs on `windows-latest` — fetch sidecar and rule sets (cached), `npm ci` + `npm run build` (the Tauri crate needs `../dist`), clippy `-D warnings`, `cargo test --workspace` with `SINGBOX_BIN`, and fails if the regenerated bindings differ from the committed ones. `release.yml` runs on a `v*` tag: the tag must equal `tauri.conf.json`'s version, and it builds the NSIS installer and creates a **draft** release with it and `SHA256SUMS.txt`. The rule sets are a Karing snapshot (`KaringX/karing-ruleset` branch `sing` keeps no history), pinned as the asset of the `rulesets-<date>` prerelease; a new snapshot is a new release + new date and SHA-256 in `fetch-rulesets.ps1`. A release bumps the version in `Cargo.toml` (workspace), `Cargo.lock`, `package.json`, `package-lock.json` and `tauri.conf.json`. `README.md` is English, `README.zh-TW.md` Traditional Chinese — keep both in step.
 
 The app manifest is `requireAdministrator` (TUN), so `tauri dev` and `cargo test -p proxydesk` need an elevated shell. Debug builds expose WebView2 DevTools on `PROXYDESK_CDP_PORT` (e.g. 9222) for Playwright `connectOverCDP` UI automation; release builds never do. While that port is open any local process can drive the elevated webview — set it only for automation runs.
 

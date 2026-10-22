@@ -7,8 +7,10 @@ sing-box 1.14.2
   run as a separate process. ProxyDesk does not link against it.
 
 Rule sets (resources/rulesets: geosite, geoip, acl .srs files)
-  Taken from the Karing project (https://github.com/KaringX/karing) for development builds.
-  Upstream sources include v2fly/domain-list-community (MIT), SagerNet sing-geoip
-  (GPL-3.0, derived from MaxMind GeoLite2 / ipinfo data) and ACL4SSR rule lists.
-  Release builds should compile these from upstream with their licenses attached
-  (see docs/PLAN.md §10).
+  A snapshot (2026-10-06) of Karing's rule sets:
+  https://github.com/KaringX/karing-ruleset (branch `sing`)
+  - geosite / geoip: from MetaCubeX/meta-rules-dat (GPL-3.0),
+    https://github.com/MetaCubeX/meta-rules-dat, built on
+    v2fly/domain-list-community (MIT) and public GeoIP data.
+  - acl: from ACL4SSR (CC BY-SA 4.0), https://github.com/ACL4SSR/ACL4SSR
+  Distributed unmodified.

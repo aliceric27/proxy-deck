@@ -8,7 +8,7 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-[![Release](https://img.shields.io/github/v/release/aliceric27/proxy-deck?include_prereleases&sort=semver)](https://github.com/aliceric27/proxy-deck/releases)
+[![Release](https://img.shields.io/github/v/release/aliceric27/proxy-deck?sort=semver)](https://github.com/aliceric27/proxy-deck/releases)
 [![CI](https://github.com/aliceric27/proxy-deck/actions/workflows/ci.yml/badge.svg)](https://github.com/aliceric27/proxy-deck/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/aliceric27/proxy-deck/total)](https://github.com/aliceric27/proxy-deck/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -94,19 +94,19 @@ If the profile cannot be read (corrupted, or locked by another program), one of 
 
 - UI: Tauri v2 (Rust) + React + Tailwind, desktop-first layout
 - Core: unmodified sing-box 1.14.2, run as a separate child process (GPL-3.0, not linked)
-- Design notes and decisions: [`docs/PLAN.md`](docs/PLAN.md) (Chinese)
 
 Requirements: Rust (stable, MSVC), Visual Studio Build Tools (C++ workload), Node.js 22+, WebView2.
 
 ```powershell
 pwsh -File scripts/fetch-singbox.ps1   # downloads sing-box, checks its SHA-256, puts it in src-tauri/binaries/
+pwsh -File scripts/fetch-rulesets.ps1  # downloads the pinned rule-set snapshot, checks its SHA-256, puts it in src-tauri/resources/rulesets/
 cd apps/desktop
 npm install
 npm run tauri dev                       # dev mode; TUN needs an elevated terminal
 npm run tauri build                     # builds target/release/bundle/nsis/ProxyDesk_<ver>_x64-setup.exe
 ```
 
-The app manifest requires administrator rights (that is how v1 gets TUN access, see PLAN §6.1). Started from a non-elevated terminal, it shows a UAC prompt.
+The app manifest requires administrator rights (that is how v1 gets TUN access). Started from a non-elevated terminal, it shows a UAC prompt.
 
 ### Tests
 
@@ -118,7 +118,7 @@ cargo test --workspace                  # adds the core state machine (fake laun
 cd apps/desktop; npx tsc --noEmit       # frontend type check
 ```
 
-M0 verification setups: `docker/m0/` (Linux container, see its README) and `docs/m0-spike/windows/run-m0.ps1` (Windows host). Both read credentials from `.env.local` in the repo root (`MUDFISH_USER=` / `MUDFISH_PASS=`, never commit it).
+M0 verification setup: `docker/m0/` (Linux container, see its README). It reads credentials from `.env.local` in the repo root (`MUDFISH_USER=` / `MUDFISH_PASS=`, never commit it).
 
 ### Releasing
 
@@ -136,13 +136,22 @@ crates/proxy-core/        profile model, Mudfish list parsing, hand-added nodes 
 apps/desktop/src-tauri/   Tauri backend: sing-box child process, Clash API client, Credential Manager, traffic history, tray
 apps/desktop/src/         React frontend: dashboard, nodes, groups, connections, traffic, logs, settings
 docker/m0/                M0 Docker verification setup
-docs/                     PLAN.md and M0 verification scripts
+scripts/                  fetch-singbox.ps1 and fetch-rulesets.ps1
 ```
+
+## Credits
+
+ProxyDesk would not exist without these projects. The installer bundles them unmodified; see also [`THIRD_PARTY_NOTICES.txt`](apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt).
+
+- [sing-box](https://github.com/SagerNet/sing-box) (GPL-3.0-or-later) — the proxy core, run as a separate process that ProxyDesk does not link against.
+- [Karing rule sets](https://github.com/KaringX/karing-ruleset) — the built-in geosite, geoip and acl rule sets are a snapshot (2026-10-06) of its `sing` branch, which compiles:
+  - [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) (GPL-3.0) for geosite and geoip, built on [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) (MIT) and public GeoIP data;
+  - [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR) (CC BY-SA 4.0) for the acl sets.
+- [Karing](https://github.com/KaringX/karing) — the diversion-rule format the group import understands.
+- [Tauri](https://tauri.app), [React](https://react.dev), [Tailwind CSS](https://tailwindcss.com) and [Lucide](https://lucide.dev) for the app itself.
 
 ## License
 
-ProxyDesk is released under the [MIT License](LICENSE).
-
-The installer bundles the unmodified official [sing-box](https://github.com/SagerNet/sing-box) binary (GPL-3.0-or-later), run as a separate process that ProxyDesk does not link against. Rule sets and other third-party components and their licenses are listed in [`THIRD_PARTY_NOTICES.txt`](apps/desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt).
+ProxyDesk is released under the [MIT License](LICENSE). The bundled components above keep their own licenses.
 
 ProxyDesk is not affiliated with Mudfish or Cloudflare.

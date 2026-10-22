@@ -37,6 +37,19 @@ jobs:
       - name: Fetch sing-box sidecar
         run: pwsh -File scripts/fetch-singbox.ps1
 
+      # Not in git either; the tests generate configs against these files. Cached so CI runs do not
+      # count as downloads of the release asset.
+      - name: Cache rule sets
+        id: rulesets
+        uses: actions/cache@v4
+        with:
+          path: apps/desktop/src-tauri/resources/rulesets
+          key: rulesets-${{ hashFiles('scripts/fetch-rulesets.ps1') }}
+
+      - name: Fetch rule sets
+        if: steps.rulesets.outputs.cache-hit != 'true'
+        run: pwsh -File scripts/fetch-rulesets.ps1
+
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci

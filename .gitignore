@@ -7,3 +7,9 @@ dist/
 
 # sing-box sidecar (80 MB); fetched by scripts/fetch-singbox.ps1
 apps/desktop/src-tauri/binaries/
+
+# Rule-set snapshot (2,400 .srs files); fetched by scripts/fetch-rulesets.ps1
+apps/desktop/src-tauri/resources/rulesets/
+
+# Design notes and verification scripts, kept local
+docs/

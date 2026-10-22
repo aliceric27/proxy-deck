@@ -35,6 +35,9 @@ jobs:
       - name: Fetch sing-box sidecar
         run: pwsh -File scripts/fetch-singbox.ps1
 
+      - name: Fetch rule sets
+        run: pwsh -File scripts/fetch-rulesets.ps1
+
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci
